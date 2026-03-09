@@ -160,3 +160,12 @@ lora_to_layer: # (int, optional) Stop applying at layer index
 lora_allow_depthwise: False # (bool) Allow depthwise convolution
 lora_kernels: # (list[int], optional) Filter by kernel size
 lora_gradient_checkpointing: True # (bool) Enable gradient checkpointing for LoRA memory optimization
+
+# MoE (Mixture-of-Experts) settings -----------------------------------------------------------------------------------------
+moe_num_experts: 4 # (int) Number of experts in MoE layers (0 to use model config)
+moe_top_k: 2 # (int) Number of experts to activate per token
+moe_balance_loss: 0.01 # (float) Load balancing loss coefficient for MoE
+moe_noise_std: 1.0 # (float) Noise standard deviation for MoE routing
+moe_temperature: 1.0 # (float) Temperature for MoE routing logits
+moe_router_z_loss: 0.001 # (float) Router z-loss coefficient for MoE
+moe_weight_threshold: 0.01 # (float) Weight threshold for conditional computation in MoE

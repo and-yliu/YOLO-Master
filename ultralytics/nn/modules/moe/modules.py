@@ -14,12 +14,13 @@ from typing import Tuple, Dict, Optional, Union
 from .utils import FlopsUtils, get_safe_groups, BatchedExpertComputation
 from .experts import (
     OptimizedSimpleExpert, FusedGhostExpert, SimpleExpert, GhostExpert,
-    InvertedResidualExpert, EfficientExpertGroup
+    InvertedResidualExpert, EfficientExpertGroup, SpatialExpert
 )
 from .routers import (
     UltraEfficientRouter, EfficientSpatialRouter, LocalRoutingLayer,
     AdaptiveRoutingLayer, DynamicRoutingLayer, AdvancedRoutingLayer
 )
+from ultralytics.nn.modules.block import ABlock, A2C2f, C3k
 from torch.cuda.amp import autocast
 from .loss import MoELoss
 
@@ -647,11 +648,13 @@ class OptimizedMOEImproved(nn.Module):
             out_channels: int,
             num_experts: int = 4,
             top_k: int = 2,
-            expert_type: str = 'simple',  # ['simple', 'ghost', 'inverted']
+            expert_type: str = 'simple',  # ['simple', 'ghost', 'inverted', 'spatial']
             router_type: str = 'efficient',  # ['efficient', 'local', 'adaptive']
             noise_std: float = 1.0,
             balance_loss_coeff: float = 0.01,
-            router_z_loss_coeff: float = 1e-3
+            router_z_loss_coeff: float = 1e-3,
+            expert_expand_ratio: float = 2.0,
+            progressive_sparsity: bool = True
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -660,6 +663,12 @@ class OptimizedMOEImproved(nn.Module):
         self.top_k = top_k
         self.balance_loss_coeff = balance_loss_coeff
         self.router_z_loss_coeff = router_z_loss_coeff
+        self.progressive_sparsity = progressive_sparsity
+
+        # Progressive Sparsity
+        self.register_buffer('training_step', torch.tensor(0))
+        self.register_buffer('current_top_k', torch.tensor(num_experts))
+        self.warmup_steps = 5000
 
         # 1) Instantiate Router
         if router_type == 'local':
@@ -671,15 +680,22 @@ class OptimizedMOEImproved(nn.Module):
 
         # 2) Instantiate Experts
         self.experts = nn.ModuleList()
+        kwargs = {}
         if expert_type == 'ghost':
             expert_cls = GhostExpert
+            kwargs['ratio'] = int(expert_expand_ratio)
         elif expert_type == 'inverted':
             expert_cls = InvertedResidualExpert
+            kwargs['expand_ratio'] = expert_expand_ratio
+        elif expert_type == 'spatial':
+            expert_cls = SpatialExpert
+            kwargs['expand_ratio'] = expert_expand_ratio
         else:
             expert_cls = SimpleExpert
+            kwargs['expand_ratio'] = expert_expand_ratio
 
         for _ in range(num_experts):
-            self.experts.append(expert_cls(in_channels, out_channels))
+            self.experts.append(expert_cls(in_channels, out_channels, **kwargs))
 
         # 3) Shared expert (Always active)
         self.shared_expert = nn.Sequential(
@@ -714,12 +730,35 @@ class OptimizedMOEImproved(nn.Module):
             if last_conv.bias is not None:
                 nn.init.constant_(last_conv.bias, 0)
 
+    def _update_sparsity(self):
+        """Progressive Sparsity Scheduling"""
+        if self.training_step < self.warmup_steps:
+            progress = self.training_step.float() / self.warmup_steps
+            current_k = self.num_experts - progress * (self.num_experts - self.top_k)
+            self.current_top_k.fill_(max(self.top_k, int(current_k)))
+        else:
+            self.current_top_k.fill_(self.top_k)
+
     def forward(self, x):
         B, C, H, W = x.shape
+
+        if self.training and self.progressive_sparsity:
+            self._update_sparsity()
+            self.training_step += 1
+            
+        # Use current_top_k for routing
+        adaptive_top_k = int(self.current_top_k.item()) if self.training and self.progressive_sparsity else self.top_k
+        
+        # Temporarily modify routing.top_k
+        original_top_k = self.routing.top_k
+        self.routing.top_k = adaptive_top_k
 
         # 1) Routing (standardized interface)
         # loss_dict contains training loss inputs; empty during inference
         routing_weights, routing_indices, loss_dict = self.routing(x)
+        
+        # Restore routing.top_k
+        self.routing.top_k = original_top_k
 
         # 2) Shared expert compute
         shared_out = self.shared_expert(x)
@@ -728,8 +767,8 @@ class OptimizedMOEImproved(nn.Module):
         # Initialize outputs with zeros
         expert_output = torch.zeros(B, self.out_channels, H, W, device=x.device, dtype=x.dtype)
 
-        indices_flat = routing_indices.view(B, self.top_k)
-        weights_flat = routing_weights.view(B, self.top_k)
+        indices_flat = routing_indices.view(B, adaptive_top_k)
+        weights_flat = routing_weights.view(B, adaptive_top_k)
 
         for i in range(self.num_experts):
             # Find all samples assigned to expert i
@@ -748,6 +787,10 @@ class OptimizedMOEImproved(nn.Module):
                 expert_output.index_add_(0, batch_idx, out.to(expert_output.dtype) * w.to(expert_output.dtype))
 
         final_output = shared_out + expert_output
+        
+        # Add residual connection if dimensions match
+        if self.in_channels == self.out_channels:
+            final_output = final_output + x
 
         # 4) Compute and return Loss during training
         if self.training and loss_dict:
@@ -759,10 +802,73 @@ class OptimizedMOEImproved(nn.Module):
 
         return final_output
 
+
+class ABlockMoE(ABlock):
+    """Area-attention block module with MoE-FFN for efficient feature extraction."""
+
+    def __init__(self, dim: int, num_heads: int, mlp_ratio: float = 1.2, area: int = 1, num_experts=4, top_k=2, expert_type='simple'):
+        super().__init__(dim, num_heads, mlp_ratio, area)
+        # Replace MLP with MoE
+        self.mlp = OptimizedMOEImproved(
+            in_channels=dim,
+            out_channels=dim,
+            num_experts=num_experts,
+            top_k=top_k,
+            expert_type=expert_type,
+            expert_expand_ratio=mlp_ratio,
+            progressive_sparsity=True
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.attn(x)
+        return self.mlp(x) # MLP handles residual internally if in==out, but ABlock expects + MLP(x).
+                           # Wait, OptimizedMOEImproved handles residual internally if in==out.
+                           # ABlock original: return x + self.mlp(x)
+                           # OptimizedMOEImproved: return shared + experts + x (if residual)
+                           # So if I call self.mlp(x), it returns x + delta.
+                           # If I do x + self.mlp(x), I get x + (x + delta) = 2x + delta.
+                           # This is wrong.
+                           # I should just return self.mlp(x) since it already adds x.
+                           # BUT, wait. ABlock original: x = x + attn(x). Then return x + mlp(x).
+                           # My new forward: x = x + attn(x). return self.mlp(x).
+                           # This is correct if OptimizedMOEImproved adds residual.
+                           # OptimizedMOEImproved adds residual if in==out. Here dim==dim, so yes.
+
+
+class A2C2fMoE(A2C2f):
+    """Area-Attention C2f module with MoE-FFN."""
+
+    def __init__(
+        self,
+        c1: int,
+        c2: int,
+        n: int = 1,
+        a2: bool = True,
+        area: int = 1,
+        residual: bool = False,
+        mlp_ratio: float = 2.0,
+        e: float = 0.5,
+        g: int = 1,
+        shortcut: bool = True,
+        num_experts: int = 4,
+        top_k: int = 2,
+        expert_type: str = 'simple'
+    ):
+        super().__init__(c1, c2, n, a2, area, residual, mlp_ratio, e, g, shortcut)
+        c_ = int(c2 * e)
+        # Re-initialize self.m with ABlockMoE
+        self.m = nn.ModuleList(
+            nn.Sequential(*(ABlockMoE(c_, c_ // 32, mlp_ratio, area, num_experts, top_k, expert_type) for _ in range(2)))
+            if a2
+            else C3k(c_, c_, 2, shortcut, g)
+            for _ in range(n)
+        )
+
     @property
     def aux_loss(self):
         """Retrieve the auxiliary loss from the registry."""
-        return MOE_LOSS_REGISTRY.get(self, torch.tensor(0.0))
+        default = torch.tensor(0.0, device=next(self.parameters()).device)
+        return MOE_LOSS_REGISTRY.get(self, default)
 
     def get_gflops(self, input_shape: Tuple[int, int, int, int]) -> Dict[str, float]:
         """Accurate GFLOPs calculation"""

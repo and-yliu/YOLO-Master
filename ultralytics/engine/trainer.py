@@ -390,6 +390,29 @@ class BaseTrainer:
                 warnings.simplefilter("ignore")  # suppress 'Detected lr_scheduler.step() before optimizer.step()'
                 self.scheduler.step()
 
+            # MoE Strategy: Freeze experts for first 5 epochs
+            moe_warmup_epochs = 5
+            expert_params = [p for n, p in self.model.named_parameters() if "experts" in n]
+            if epoch < moe_warmup_epochs:
+                for p in expert_params:
+                    p.requires_grad = False
+            elif epoch == moe_warmup_epochs:
+                LOGGER.info("Unfreezing MoE experts...")
+                for p in expert_params:
+                    p.requires_grad = True
+
+            # MoE Coeff Decay
+            if hasattr(self.args, 'moe'):
+                # Cosine decay: 0.3 -> 0.05
+                progress = epoch / self.epochs
+                moe_gain = 0.05 + 0.5 * (0.3 - 0.05) * (1 + math.cos(math.pi * progress))
+                self.args.moe = moe_gain
+                # Also update model args/hyp if needed (propagate to loss)
+                if hasattr(self.model, 'args') and isinstance(self.model.args, dict):
+                    self.model.args['moe'] = moe_gain
+                elif hasattr(self.model, 'args') and hasattr(self.model.args, 'moe'):
+                    self.model.args.moe = moe_gain
+
             self._model_train()
             if RANK != -1:
                 self.train_loader.sampler.set_epoch(epoch)
@@ -940,7 +963,7 @@ class BaseTrainer:
         Returns:
             (torch.optim.Optimizer): The constructed optimizer.
         """
-        g = [], [], []  # optimizer parameter groups
+        g = [], [], [], []  # optimizer parameter groups
         bn = tuple(v for k, v in nn.__dict__.items() if "Norm" in k)  # normalization layers, i.e. BatchNorm2d()
         if name == "auto":
             LOGGER.info(
@@ -956,7 +979,9 @@ class BaseTrainer:
         for module_name, module in model.named_modules():
             for param_name, param in module.named_parameters(recurse=False):
                 fullname = f"{module_name}.{param_name}" if module_name else param_name
-                if "bias" in fullname:  # bias (no decay)
+                if "routing" in fullname or "router" in fullname:  # MoE Router parameters
+                    g[3].append(param)
+                elif "bias" in fullname:  # bias (no decay)
                     g[2].append(param)
                 elif isinstance(module, bn) or "logit_scale" in fullname:  # weight (no decay)
                     # ContrastiveHead and BNContrastiveHead included here with 'logit_scale'
@@ -980,8 +1005,10 @@ class BaseTrainer:
 
         optimizer.add_param_group({"params": g[0], "weight_decay": decay})  # add g0 with weight_decay
         optimizer.add_param_group({"params": g[1], "weight_decay": 0.0})  # add g1 (BatchNorm2d weights)
+        optimizer.add_param_group({"params": g[3], "weight_decay": decay, "lr": lr * 0.1})  # add g3 (MoE Router) with 0.1x lr
         LOGGER.info(
             f"{colorstr('optimizer:')} {type(optimizer).__name__}(lr={lr}, momentum={momentum}) with parameter groups "
-            f"{len(g[1])} weight(decay=0.0), {len(g[0])} weight(decay={decay}), {len(g[2])} bias(decay=0.0)"
+            f"{len(g[1])} weight(decay=0.0), {len(g[0])} weight(decay={decay}), {len(g[2])} bias(decay=0.0), "
+            f"{len(g[3])} router(lr=0.1x)"
         )
         return optimizer

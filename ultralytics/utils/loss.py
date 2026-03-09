@@ -321,7 +321,7 @@ class v8SegmentationLoss(v8DetectionLoss):
 
     def __call__(self, preds: Any, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         """Calculate and return the combined loss for detection and segmentation."""
-        loss = torch.zeros(4, device=self.device)  # box, seg, cls, dfl
+        loss = torch.zeros(5, device=self.device)  # box, seg, cls, dfl, moe
         feats, pred_masks, proto = preds if len(preds) == 3 else preds[1]
         batch_size, _, mask_h, mask_w = proto.shape  # batch size, number of masks, mask height, mask width
         pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
@@ -400,7 +400,15 @@ class v8SegmentationLoss(v8DetectionLoss):
         loss[2] *= self.hyp.cls  # cls gain
         loss[3] *= self.hyp.dfl  # dfl gain
 
-        return loss * batch_size, loss.detach()  # loss(box, seg, cls, dfl)
+        # MoE auxiliary loss
+        moe_loss = torch.tensor(0.0, device=self.device)
+        if hasattr(self, 'model'):
+             for m in self.model.modules():
+                 if hasattr(m, 'aux_loss'):
+                     moe_loss += m.aux_loss
+        loss[4] = moe_loss * self.hyp.moe
+
+        return loss * batch_size, loss.detach()  # loss(box, seg, cls, dfl, moe)
 
     @staticmethod
     def single_mask_loss(
@@ -507,7 +515,7 @@ class v8PoseLoss(v8DetectionLoss):
 
     def __call__(self, preds: Any, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         """Calculate the total loss and detach it for pose estimation."""
-        loss = torch.zeros(5, device=self.device)  # box, cls, dfl, kpt_location, kpt_visibility
+        loss = torch.zeros(6, device=self.device)  # box, cls, dfl, kpt_location, kpt_visibility, moe
         feats, pred_kpts = preds if isinstance(preds[0], list) else preds[1]
         pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
             (self.reg_max * 4, self.nc), 1
@@ -568,6 +576,14 @@ class v8PoseLoss(v8DetectionLoss):
         loss[2] *= self.hyp.kobj  # kobj gain
         loss[3] *= self.hyp.cls  # cls gain
         loss[4] *= self.hyp.dfl  # dfl gain
+
+        # MoE auxiliary loss
+        moe_loss = torch.tensor(0.0, device=self.device)
+        if hasattr(self, 'model'):
+             for m in self.model.modules():
+                 if hasattr(m, 'aux_loss'):
+                     moe_loss += m.aux_loss
+        loss[5] = moe_loss * self.hyp.moe
 
         return loss * batch_size, loss.detach()  # loss(box, cls, dfl)
 
@@ -691,7 +707,7 @@ class v8OBBLoss(v8DetectionLoss):
 
     def __call__(self, preds: Any, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         """Calculate and return the loss for oriented bounding box detection."""
-        loss = torch.zeros(3, device=self.device)  # box, cls, dfl
+        loss = torch.zeros(4, device=self.device)  # box, cls, dfl, moe
         feats, pred_angle = preds if isinstance(preds[0], list) else preds[1]
         batch_size = pred_angle.shape[0]  # batch size, number of masks, mask height, mask width
         pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
@@ -759,7 +775,15 @@ class v8OBBLoss(v8DetectionLoss):
         loss[1] *= self.hyp.cls  # cls gain
         loss[2] *= self.hyp.dfl  # dfl gain
 
-        return loss * batch_size, loss.detach()  # loss(box, cls, dfl)
+        # MoE auxiliary loss
+        moe_loss = torch.tensor(0.0, device=self.device)
+        if hasattr(self, 'model'):
+             for m in self.model.modules():
+                 if hasattr(m, 'aux_loss'):
+                     moe_loss += m.aux_loss
+        loss[3] = moe_loss * self.hyp.moe
+
+        return loss * batch_size, loss.detach()  # loss(box, cls, dfl, moe)
 
     def bbox_decode(
         self, anchor_points: torch.Tensor, pred_dist: torch.Tensor, pred_angle: torch.Tensor

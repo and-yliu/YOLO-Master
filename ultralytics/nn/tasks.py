@@ -89,6 +89,8 @@ from ultralytics.nn.modules import (
     HyperFusedMoE,
     HyperUltimateMoE,
     UltimateOptimizedMoE,
+    A2C2fMoE,
+    ABlockMoE,
 )
 from ultralytics.utils import DEFAULT_CFG_DICT, LOGGER, YAML, colorstr, emojis
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
@@ -1659,6 +1661,8 @@ def parse_model(d, ch, verbose=True):
             HyperFusedMoE,
             HyperUltimateMoE,
             UltimateOptimizedMoE,
+            A2C2fMoE,
+            ABlockMoE,
         }
     )
     repeat_modules = frozenset(  # modules with 'repeat' arguments
@@ -1680,6 +1684,7 @@ def parse_model(d, ch, verbose=True):
             C2f_LSKA,
             C2PSA,
             A2C2f,
+            A2C2fMoE,
             WaveC2f,
             DyC2f,
             A3C2f,
@@ -1721,6 +1726,8 @@ def parse_model(d, ch, verbose=True):
                 legacy = False
                 if scale in "lx":  # for L/X sizes
                     args.extend((True, 1.2))
+            if m is A2C2fMoE:
+                legacy = False
             if m is C2fCIB:
                 legacy = False
         elif m is AIFI:

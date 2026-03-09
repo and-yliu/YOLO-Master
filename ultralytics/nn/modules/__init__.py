@@ -109,7 +109,22 @@ from .transformer import (
     TransformerEncoderLayer,
     TransformerLayer,
 )
-from .moe import OptimizedMOE, OptimizedMOEImproved, MOE, ES_MOE, EfficientSpatialRouterMoE, ModularRouterExpertMoE, UltraOptimizedMoE, AdaptiveCapacityMoE, HyperSplitMoE, HyperFusedMoE, HyperUltimateMoE, UltimateOptimizedMoE
+from .moe import (
+    OptimizedMOE,
+    OptimizedMOEImproved,
+    MOE,
+    ES_MOE,
+    EfficientSpatialRouterMoE,
+    ModularRouterExpertMoE,
+    UltraOptimizedMoE,
+    AdaptiveCapacityMoE,
+    HyperSplitMoE,
+    HyperFusedMoE,
+    HyperUltimateMoE,
+    UltimateOptimizedMoE,
+    A2C2fMoE,
+    ABlockMoE,
+)
 
 __all__ = (
     "AIFI",
@@ -208,4 +223,6 @@ __all__ = (
     "HyperFusedMoE",
     "HyperUltimateMoE",
     "UltimateOptimizedMoE",
+    "A2C2fMoE",
+    "ABlockMoE",
 )

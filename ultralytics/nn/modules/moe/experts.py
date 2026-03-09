@@ -86,6 +86,29 @@ class SimpleExpert(nn.Module):
     def compute_flops(self, input_shape): return FlopsUtils.count_conv2d(self.conv, input_shape)
 
 
+class SpatialExpert(nn.Module):
+    """Expert network with 3x3 spatial convolution, enabling experts to learn spatial patterns."""
+    def __init__(self, in_ch, out_ch, expand_ratio=2):
+        super().__init__()
+        hid = int(in_ch * expand_ratio)
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_ch, hid, 1, bias=False),
+            nn.BatchNorm2d(hid),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(hid, hid, 3, padding=1, groups=hid, bias=False),  # DW spatial conv
+            nn.BatchNorm2d(hid),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(hid, out_ch, 1, bias=False),
+            nn.BatchNorm2d(out_ch),
+        )
+
+    def forward(self, x):
+        return self.conv(x)
+
+    def compute_flops(self, input_shape):
+        return FlopsUtils.count_conv2d(self.conv, input_shape)
+
+
 class GhostExpert(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size=3, ratio=2):
         super().__init__()
