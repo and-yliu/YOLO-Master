@@ -20,15 +20,19 @@ class MoELoss(nn.Module):
         self,
         balance_loss_coeff: float = 0.01,
         z_loss_coeff: float = 1e-3,
-        entropy_loss_coeff: float = 0.0, # New: Penalize uncertainty
+        entropy_loss_coeff: float = 0.0,
+        diversity_loss_coeff: float = 0.0,  # New: penalize similar expert outputs
+        variance_loss_coeff: float = 0.0,   # New: direct variance penalty on usage
         num_experts: int = 8,
         top_k: int = 2,
-        use_soft_balancing: bool = False # New: Use probs instead of indices for usage
+        use_soft_balancing: bool = True
     ):
         super().__init__()
         self.balance_loss_coeff = balance_loss_coeff
         self.z_loss_coeff = z_loss_coeff
         self.entropy_loss_coeff = entropy_loss_coeff
+        self.diversity_loss_coeff = diversity_loss_coeff
+        self.variance_loss_coeff = variance_loss_coeff
         self.num_experts = num_experts
         self.top_k = top_k
         self.use_soft_balancing = use_soft_balancing
@@ -53,6 +57,7 @@ class MoELoss(nn.Module):
         router_probs: torch.Tensor,
         router_logits: torch.Tensor,
         expert_indices: Optional[torch.Tensor] = None,
+        expert_outputs: Optional[torch.Tensor] = None,
         return_dict: bool = False
     ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
         """
@@ -60,12 +65,10 @@ class MoELoss(nn.Module):
             router_probs: [B, num_experts] Full probability distribution
             router_logits: [B, num_experts] Raw logits
             expert_indices: [B, k] Selected expert indices (required if use_soft_balancing=False)
+            expert_outputs: [B, num_experts, D] Expert output features for diversity loss
             return_dict: If True, returns a dict with loss components for logging.
         """
         # 1. Load Balancing Loss
-        # ------------------------------------------------------------------
-        # Importance: Global average probability for each expert
-        # [num_experts]
         importance = self._get_global_mean(router_probs)
 
         if self.use_soft_balancing:
@@ -107,20 +110,44 @@ class MoELoss(nn.Module):
         z_loss = torch.mean(log_z ** 2)
 
         # 3. Entropy Loss (Certainty Regularization) - Optional
-        # ------------------------------------------------------------------
-        # We want the router to be "sure" about its choice.
-        # Minimize Entropy: sum(-p * log(p))
-        # Note: Use a small epsilon for log stability
         entropy_loss = torch.tensor(0.0, device=router_probs.device)
         if self.entropy_loss_coeff > 0:
             entropy = -torch.sum(router_probs * torch.log(router_probs + 1e-8), dim=1).mean()
             entropy_loss = entropy
 
-        # 4. Total Loss
-        # ------------------------------------------------------------------
+        # 4. Diversity Loss (Penalize similar expert outputs) - Optional
+        # Targets orthogonal experts: cosine similarity -> 0, not -1
+        diversity_loss = torch.tensor(0.0, device=router_probs.device)
+        if self.diversity_loss_coeff > 0 and expert_outputs is not None:
+            # expert_outputs: [B, num_experts, D]
+            B, E, D = expert_outputs.shape
+            # Normalize each expert output
+            outputs_norm = F.normalize(expert_outputs, dim=-1)  # [B, E, D]
+            # Compute pairwise cosine similarity: [B, E, E]
+            similarity = torch.bmm(outputs_norm, outputs_norm.transpose(1, 2))  # [B, E, E]
+            # Zero out diagonal (self-similarity)
+            mask = 1.0 - torch.eye(E, device=similarity.device)
+            masked_sim = similarity * mask.unsqueeze(0)  # [B, E, E]
+            # Target: similarity -> 0 (orthogonal), penalize deviation from 0
+            num_pairs = E * (E - 1)
+            diversity_loss = (masked_sim ** 2).sum() / (B * num_pairs + 1e-8)
+
+        # 5. Variance Loss (Direct usage variance penalty) - Optional
+        # Penalizes high variance in expert usage, encouraging uniform distribution
+        variance_loss = torch.tensor(0.0, device=router_probs.device)
+        if self.variance_loss_coeff > 0:
+            # Target: uniform distribution -> variance = 0
+            # usage here is importance (soft) or counts (hard)
+            target_usage = 1.0 / self.num_experts
+            variance = torch.mean((usage - target_usage) ** 2)
+            variance_loss = variance
+
+        # 6. Total Loss
         total_loss = (self.balance_loss_coeff * balance_loss) + \
                      (self.z_loss_coeff * z_loss) + \
-                     (self.entropy_loss_coeff * entropy_loss)
+                     (self.entropy_loss_coeff * entropy_loss) + \
+                     (self.diversity_loss_coeff * diversity_loss) + \
+                     (self.variance_loss_coeff * variance_loss)
         
         # NaN Guard (Graph Safe)
         if torch.isnan(total_loss) or torch.isinf(total_loss):
@@ -131,7 +158,9 @@ class MoELoss(nn.Module):
                 "loss": total_loss,
                 "balance_loss": balance_loss.detach(),
                 "z_loss": z_loss.detach(),
-                "entropy_loss": entropy_loss.detach() if self.entropy_loss_coeff > 0 else 0.0
+                "entropy_loss": entropy_loss.detach() if self.entropy_loss_coeff > 0 else 0.0,
+                "diversity_loss": diversity_loss.detach() if self.diversity_loss_coeff > 0 else 0.0,
+                "variance_loss": variance_loss.detach() if self.variance_loss_coeff > 0 else 0.0
             }
             
         return total_loss

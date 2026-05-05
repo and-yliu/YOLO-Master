@@ -1768,6 +1768,29 @@ def parse_model(d, ch, verbose=True):
             c2 = ch[f]
 
         m_ = torch.nn.Sequential(*(m(*args) for _ in range(n))) if n > 1 else m(*args)  # module
+
+        # Inject MoE hyperparameters from global config into MoE modules
+        # This bridges the gap between YAML config (moe_balance_loss, etc.)
+        # and module constructor defaults (balance_loss_coeff, etc.)
+        _moe_cfg = d.get("moe_config", {})
+        if _moe_cfg:
+            for sub_m in (m_.modules() if hasattr(m_, 'modules') else []):
+                if hasattr(sub_m, 'balance_loss_coeff') and 'balance_loss_coeff' in _moe_cfg:
+                    sub_m.balance_loss_coeff = _moe_cfg['balance_loss_coeff']
+                if hasattr(sub_m, 'router_z_loss_coeff') and 'router_z_loss_coeff' in _moe_cfg:
+                    sub_m.router_z_loss_coeff = _moe_cfg['router_z_loss_coeff']
+                if hasattr(sub_m, 'routing') and hasattr(sub_m.routing, 'noise_std') and 'noise_std' in _moe_cfg:
+                    sub_m.routing.noise_std = _moe_cfg['noise_std']
+                if hasattr(sub_m, 'routing') and hasattr(sub_m.routing, 'temperature') and 'temperature' in _moe_cfg:
+                    sub_m.routing.temperature = _moe_cfg['temperature']
+                if hasattr(sub_m, 'weight_threshold') and 'weight_threshold' in _moe_cfg:
+                    sub_m.weight_threshold = _moe_cfg['weight_threshold']
+                # Propagate to internal MoELoss if present
+                if hasattr(sub_m, 'moe_loss_fn'):
+                    if 'balance_loss_coeff' in _moe_cfg:
+                        sub_m.moe_loss_fn.balance_loss_coeff = _moe_cfg['balance_loss_coeff']
+                    if 'router_z_loss_coeff' in _moe_cfg:
+                        sub_m.moe_loss_fn.z_loss_coeff = _moe_cfg['router_z_loss_coeff']
         t = str(m)[8:-2].replace("__main__.", "")  # module type
         m_.np = sum(x.numel() for x in m_.parameters())  # number params
         m_.i, m_.f, m_.type = i, f, t  # attach index, 'from' index, type

@@ -488,3 +488,135 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+class RoutingCollapseDetector:
+    """Lightweight real-time routing collapse detector for training loops.
+
+    Collects expert usage statistics across MoE layers each step and checks
+    for collapse (one or two experts receiving >80% of routing weight).
+    When detected, suggests or auto-applies corrective actions.
+    """
+
+    def __init__(self, collapse_threshold: float = 0.8, dead_threshold: float = 0.05):
+        """
+        Args:
+            collapse_threshold: If max expert usage > threshold, flag as collapse.
+            dead_threshold: If min expert usage < threshold, flag as dead expert.
+        """
+        self.collapse_threshold = collapse_threshold
+        self.dead_threshold = dead_threshold
+        self.collapse_count = 0
+        self.last_diagnosis = {}
+
+    def diagnose(self, model: torch.nn.Module) -> dict:
+        """Scan all MoE modules and return per-layer expert usage ratios.
+
+        Returns:
+            dict mapping layer name -> {
+                'usage': [float],      # per-expert usage ratio
+                'collapsed': bool,     # max usage > threshold
+                'dead_experts': [int], # indices of dead experts
+                'max_usage': float,
+                'min_usage': float,
+            }
+        """
+        diagnosis = {}
+        for name, module in model.named_modules():
+            # Only check modules that are MoE and have routing
+            if not hasattr(module, 'num_experts'):
+                continue
+            if not hasattr(module, 'routing') and not hasattr(module, 'router'):
+                continue
+
+            num_experts = module.num_experts
+            # Try to get expert usage from the module's stored stats
+            usage = self._get_expert_usage(module, num_experts)
+            if usage is None:
+                continue
+
+            max_u = max(usage)
+            min_u = min(usage)
+            collapsed = max_u > self.collapse_threshold
+            dead = [i for i, u in enumerate(usage) if u < self.dead_threshold]
+
+            diagnosis[name] = {
+                'usage': usage,
+                'collapsed': collapsed,
+                'dead_experts': dead,
+                'max_usage': max_u,
+                'min_usage': min_u,
+            }
+
+            if collapsed:
+                self.collapse_count += 1
+
+        self.last_diagnosis = diagnosis
+        return diagnosis
+
+    def _get_expert_usage(self, module, num_experts: int):
+        """Extract expert usage ratios from a MoE module's internal stats."""
+        # OptimizedMOEImproved / ModularRouterExpertMoE
+        if hasattr(module, 'routing') and hasattr(module.routing, 'router'):
+            # Can't easily get live stats without a forward pass
+            # Fall back to last_aux_loss / last_balance_loss if available
+            pass
+
+        # ES_MOE stores expert_usage_counts
+        if hasattr(module, 'expert_usage_counts') and module.expert_usage_counts.numel() > 0:
+            total = module.expert_usage_counts.sum().item()
+            if total > 0:
+                return [module.expert_usage_counts[i].item() / total for i in range(num_experts)]
+
+        # UltraOptimizedMoE doesn't store per-step usage, skip
+        return None
+
+    def get_recovery_actions(self, diagnosis: dict) -> list:
+        """Generate corrective actions based on diagnosis.
+
+        Returns:
+            List of action dicts: [{'action': str, 'params': dict, 'reason': str}]
+        """
+        actions = []
+        for name, info in diagnosis.items():
+            if info['collapsed']:
+                actions.append({
+                    'action': 'increase_balance_loss',
+                    'params': {'factor': 2.0},
+                    'reason': f"{name}: max_usage={info['max_usage']:.2f} > {self.collapse_threshold}"
+                })
+                actions.append({
+                    'action': 'increase_noise',
+                    'params': {'noise_std': 1.0},
+                    'reason': f"{name}: routing collapsed, adding exploration noise"
+                })
+            if info['dead_experts']:
+                actions.append({
+                    'action': 'reinit_dead_experts',
+                    'params': {'expert_indices': info['dead_experts']},
+                    'reason': f"{name}: dead experts {info['dead_experts']}, min_usage={info['min_usage']:.4f}"
+                })
+        return actions
+
+    def apply_recovery(self, model: torch.nn.Module, diagnosis: dict) -> int:
+        """Apply automatic recovery actions to the model.
+
+        Returns:
+            Number of recovery actions applied.
+        """
+        actions = self.get_recovery_actions(diagnosis)
+        applied = 0
+
+        for act in actions:
+            if act['action'] == 'increase_noise':
+                # Increase noise_std on collapsed routing layers
+                for name, module in model.named_modules():
+                    if name in diagnosis and diagnosis[name]['collapsed']:
+                        if hasattr(module, 'routing') and hasattr(module.routing, 'noise_std'):
+                            old_noise = module.routing.noise_std
+                            module.routing.noise_std = max(old_noise, act['params']['noise_std'])
+                            applied += 1
+            # Other actions (increase_balance_loss, reinit_dead_experts) are
+            # applied via config changes in the trainer, not here directly.
+
+        return applied

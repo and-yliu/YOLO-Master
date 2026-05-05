@@ -354,6 +354,45 @@ class BaseTrainer:
             save_trainer_args_yaml(self.save_dir, self.args)
         self.set_model_attributes()
 
+        # MoE Routing Collapse Detector (initialize if model has MoE layers)
+        has_moe = any(hasattr(m, 'num_experts') for m in self.model.modules())
+        if has_moe:
+            from ultralytics.nn.modules.moe.analysis import RoutingCollapseDetector
+            collapse_thr = getattr(self.args, 'moe_collapse_threshold', 0.8)
+            self._moe_collapse_detector = RoutingCollapseDetector(collapse_threshold=collapse_thr)
+            LOGGER.info(f"[MoE] Routing collapse detector initialized (threshold={collapse_thr})")
+
+            # Inject MoE hyperparameters from training config into model modules
+            # This bridges the gap: YAML config (moe_balance_loss) → module defaults (balance_loss_coeff)
+            balance_loss_coeff = getattr(self.args, 'moe_balance_loss', 0.1)
+            router_z_loss_coeff = getattr(self.args, 'moe_router_z_loss', 0.01)
+            noise_std = getattr(self.args, 'moe_noise_std', 0.5)
+            temperature = getattr(self.args, 'moe_temperature', 1.0)
+            weight_threshold = getattr(self.args, 'moe_weight_threshold', 0.01)
+
+            injected = 0
+            for m in self.model.modules():
+                if hasattr(m, 'balance_loss_coeff'):
+                    m.balance_loss_coeff = balance_loss_coeff
+                    injected += 1
+                if hasattr(m, 'router_z_loss_coeff'):
+                    m.router_z_loss_coeff = router_z_loss_coeff
+                if hasattr(m, 'routing') and hasattr(m.routing, 'noise_std'):
+                    m.routing.noise_std = noise_std
+                if hasattr(m, 'routing') and hasattr(m.routing, 'temperature'):
+                    m.routing.temperature = temperature
+                if hasattr(m, 'weight_threshold'):
+                    m.weight_threshold = weight_threshold
+                # Propagate to internal MoELoss
+                if hasattr(m, 'moe_loss_fn'):
+                    m.moe_loss_fn.balance_loss_coeff = balance_loss_coeff
+                    m.moe_loss_fn.z_loss_coeff = router_z_loss_coeff
+            LOGGER.info(
+                f"[MoE] Config injected into {injected} MoE modules: "
+                f"balance_loss={balance_loss_coeff}, z_loss={router_z_loss_coeff}, "
+                f"noise_std={noise_std}, temperature={temperature}"
+            )
+
         # Few-shot mode: load teacher model for knowledge distillation
         if getattr(self.args, 'lora_few_shot_mode', False):
             teacher_path = getattr(self.args, 'lora_few_shot_teacher', None)
@@ -543,28 +582,60 @@ class BaseTrainer:
                 warnings.simplefilter("ignore")  # suppress 'Detected lr_scheduler.step() before optimizer.step()'
                 self.scheduler.step()
 
-            # MoE Strategy: Freeze experts for first 5 epochs
-            moe_warmup_epochs = 5
-            expert_params = [p for n, p in self.model.named_parameters() if "experts" in n]
+            # MoE Strategy: Freeze experts for initial epochs while router learns balanced routing
+            # Key fix: only freeze expert WEIGHTS, not shared_expert/routing — and use shorter warmup
+            moe_warmup_epochs = getattr(self.args, 'moe_expert_warmup_epochs', 3)
+            expert_params = [p for n, p in self.model.named_parameters()
+                             if "experts" in n and "routing" not in n and "router" not in n and "shared" not in n]
             if epoch < moe_warmup_epochs:
                 for p in expert_params:
                     p.requires_grad = False
             elif epoch == moe_warmup_epochs:
-                LOGGER.info("Unfreezing MoE experts...")
+                LOGGER.info(f"[MoE] Unfreezing expert weights after {moe_warmup_epochs}-epoch router warmup...")
                 for p in expert_params:
                     p.requires_grad = True
 
-            # MoE Coeff Decay
+            # MoE Gain Schedule (fixed: was cosine 0.3→0.05, too aggressive decay)
+            # New: warmup → plateau → gentle decay. Prevents late-training routing collapse.
             if hasattr(self.args, 'moe'):
-                # Cosine decay: 0.3 -> 0.05
+                initial_moe = getattr(self.args, 'moe', 0.3)
                 progress = epoch / self.epochs
-                moe_gain = 0.05 + 0.5 * (0.3 - 0.05) * (1 + math.cos(math.pi * progress))
+                if progress < 0.1:
+                    # Phase 1: warmup — ramp from 0.5x to 1x initial gain
+                    moe_gain = initial_moe * (0.5 + 0.5 * (progress / 0.1))
+                elif progress < 0.7:
+                    # Phase 2: plateau — full gain to maintain balanced routing
+                    moe_gain = initial_moe
+                else:
+                    # Phase 3: gentle linear decay to 0.3x — avoid sudden collapse
+                    decay_progress = (progress - 0.7) / 0.3
+                    moe_gain = initial_moe * (1.0 - 0.7 * decay_progress)
                 self.args.moe = moe_gain
                 # Also update model args/hyp if needed (propagate to loss)
                 if hasattr(self.model, 'args') and isinstance(self.model.args, dict):
                     self.model.args['moe'] = moe_gain
                 elif hasattr(self.model, 'args') and hasattr(self.model.args, 'moe'):
                     self.model.args.moe = moe_gain
+
+            # MoE Routing Collapse Detection (every 5 epochs after warmup)
+            if epoch > 0 and epoch % 5 == 0 and hasattr(self, '_moe_collapse_detector'):
+                diag = self._moe_collapse_detector.diagnose(self.model)
+                collapsed_layers = [n for n, d in diag.items() if d['collapsed']]
+                if collapsed_layers:
+                    collapse_thr = getattr(self.args, 'moe_collapse_threshold', 0.8)
+                    LOGGER.warning(
+                        f"[MoE] ⚠️ Routing collapse detected at epoch {epoch}: "
+                        f"layers {collapsed_layers} have max_usage > {collapse_thr}. "
+                        f"Auto-increasing noise_std for recovery..."
+                    )
+                    applied = self._moe_collapse_detector.apply_recovery(self.model, diag)
+                    if applied > 0:
+                        LOGGER.info(f"[MoE] Applied {applied} recovery actions.")
+                    # Also boost balance_loss if not already high
+                    if hasattr(self.args, 'moe_balance_loss'):
+                        old_bl = self.args.moe_balance_loss
+                        self.args.moe_balance_loss = min(old_bl * 2.0, 0.5)
+                        LOGGER.info(f"[MoE] balance_loss boosted: {old_bl:.4f} → {self.args.moe_balance_loss:.4f}")
 
             # ── LoRA Training Strategies (per-epoch) ──
             if self.lora_strategy is not None:
@@ -1738,7 +1809,10 @@ class BaseTrainer:
 
         optimizer.add_param_group({"params": g[0], "weight_decay": decay, "initial_lr": lr})  # add g0 with weight_decay
         optimizer.add_param_group({"params": g[1], "weight_decay": 0.0, "initial_lr": lr})  # add g1 (BatchNorm2d weights)
-        optimizer.add_param_group({"params": g[3], "weight_decay": decay, "lr": lr * 0.1, "initial_lr": lr * 0.1})  # add g3 (MoE Router) with 0.1x lr
+        # MoE Router: 0.5x LR (was 0.1x, too small to correct routing collapse)
+        moe_router_lr_scale = getattr(self.args, 'moe_router_lr_scale', 0.5)
+        router_lr = lr * moe_router_lr_scale
+        optimizer.add_param_group({"params": g[3], "weight_decay": decay, "lr": router_lr, "initial_lr": router_lr})  # add g3 (MoE Router)
         
         # Add LoRA parameter group with configurable LR multiplier
         lora_log = ""
