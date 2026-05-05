@@ -1241,9 +1241,7 @@ class LoRAConfig:
             "include_head": "lora_include_head",
             "freeze_bn": "lora_freeze_bn",
             "lr_mult": "lora_lr_mult",
-            "include_moe": "lora_include_moe", 
-            "lr_mult": "lora_lr_mult",
-            "include_moe": "lora_include_moe", 
+            "include_moe": "lora_include_moe",
             "include_attention": "lora_include_attention",
             "only_backbone": "lora_only_backbone", 
             "exclude_modules": "lora_exclude_modules",
@@ -1349,6 +1347,16 @@ class LoRAConfigBuilder:
     # A2C2f -> ABlock and is therefore on the same residual stream as AAttn.
     _PAT_AREA_ATTN_MLP = re.compile(
         r"\.m\.\d+\.\d+\.mlp\.\d+(\.|$)", re.IGNORECASE
+    )
+    # RT-DETR MSDeformAttn geometry-sensitive Linear layers.
+    # sampling_offsets carries grid-initialized bias encoding the deformable
+    # sampling grid; LoRA perturbation breaks sampling geometry consistency
+    # and causes bbox regression to drift.
+    # attention_weights feeds a softmax whose weights are zero-initialized;
+    # even small LoRA deltas saturate the softmax. Both are excluded by
+    # default; opt-in requires r<=4 and long alpha_warmup.
+    _PAT_MSDEFORM_RISKY = re.compile(
+        r"(sampling_offsets|attention_weights)(\.|$)", re.IGNORECASE
     )
     _PAT_INDEX = re.compile(r"^(\d+)\.") # Matches "0" in "0.conv"
     _PAT_INDEX_ANY = re.compile(r"(?:^|\.)(\d+)\.")  # Matches first numeric segment anywhere (e.g. "model.5.m.0.cv1" -> 5)
@@ -1544,6 +1552,18 @@ class LoRAConfigBuilder:
                         f"[LoRA] Skip ABlock-MLP conv {name} (include_attention=False)"
                     )
                     continue
+
+            # RT-DETR MSDeformAttn geometry-sensitive layers.
+            # Excluded unconditionally (even when include_attention=True) because
+            # the instability source is not the attention softmax but the
+            # sampling-grid initialization and zero-init softmax weights.
+            # Users who really want to adapt these need to opt-in via explicit
+            # target_modules and tune r<=4 + long alpha_warmup.
+            if is_linear and LoRAConfigBuilder._PAT_MSDEFORM_RISKY.search(lname):
+                LOGGER.debug(
+                    f"[LoRA] Skip MSDeformAttn geometry-sensitive layer {name}"
+                )
+                continue
 
             targets.add(name)
 
@@ -1895,7 +1915,10 @@ def apply_lora(
         return model
 
     # 1. Initialize Configuration
-    config = LoRAConfig.from_args(args, **kwargs)
+    if isinstance(args, LoRAConfig):
+        config = args
+    else:
+        config = LoRAConfig.from_args(args, **kwargs)
 
     # Few-shot mode: auto-adjust hyperparameters for small datasets
     if config.few_shot_mode:

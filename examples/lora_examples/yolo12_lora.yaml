@@ -63,7 +63,7 @@ lora_use_dora: False # (bool) Enable DoRA (Weight-Decomposed Low-Rank Adaptation
 lora_type: "lora" # (str) PEFT type: "lora", "loha", "lokr"
 lora_quantization: "none" # (str) Quantization type: "none", "4bit", "8bit" (Requires bitsandbytes)
 lora_include_moe: False # (bool) Include MoE layers in auto-detection
-lora_include_attention: True # (bool) Include Attention layers in auto-detection
+lora_include_attention: False # (bool) Include Attention layers in auto-detection — YOLO12 ABlock is post-norm-free; keep False for safety
 lora_only_backbone: False # (bool) Only apply LoRA to backbone
 lora_exclude_modules: # (list[str], optional) Modules to exclude
 lora_last_n: # (int, optional) Only apply to last N layers
