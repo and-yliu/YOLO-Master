@@ -49,7 +49,7 @@ from .utils import (
     BatchedExpertComputation
 )
 
-from .analysis import ExpertUsageTracker, diagnose_model
+from .analysis import ExpertUsageTracker, diagnose_model, RoutingCollapseDetector
 from .pruning import prune_moe_model
 
 __all__ = [
@@ -85,6 +85,7 @@ __all__ = [
     "get_safe_groups",
     "BatchedExpertComputation",
     "ExpertUsageTracker",
+    "RoutingCollapseDetector",
     "diagnose_model",
     "prune_moe_model"
 ]
