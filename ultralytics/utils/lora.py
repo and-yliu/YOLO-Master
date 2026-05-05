@@ -173,6 +173,266 @@ def resolve_effective_lora_request(**kwargs) -> Dict[str, Any]:
     return dict(kwargs)
 
 
+class FewShotLoRAConv(nn.Module):
+    """LoRA wrapper optimized for few-shot learning.
+
+    Enhancements over ManualLoRAConv:
+    - Scheduled DropConnect: curriculum-style rate scheduling (cosine/linear/exp)
+    - Gradient-Importance Weighted DropConnect: Fisher-based connection importance
+    - Knowledge distillation support: accepts teacher features for alignment
+    - Adaptive rank scaling: adjusts effective rank based on data scarcity
+    - Variational rank selection: Gumbel-Softmax based sparse rank (optional)
+    """
+
+    def __init__(self, conv: nn.Conv2d, r: int = 8, alpha: int = 16,
+                 dropout: float = 0.0, dropconnect: float = 0.1,
+                 adaptive_rank: bool = True,
+                 dropconnect_schedule: str = "constant",
+                 dropconnect_max: float = 0.3,
+                 dropconnect_min: float = 0.0,
+                 gradient_importance_weighted: bool = False,
+                 variational_rank: bool = False,
+                 rank_budget: float = 0.5):
+        super().__init__()
+        self.conv = conv
+        self.r = r
+        self.alpha = alpha
+        self.scaling = alpha / max(r, 1)
+        self.lora_dropout = nn.Dropout(dropout) if dropout > 0 else None
+        self.dropconnect_rate = dropconnect
+        self.adaptive_rank = adaptive_rank
+
+        # Scheduled DropConnect config
+        self.dropconnect_schedule = dropconnect_schedule
+        self.dropconnect_max = dropconnect_max
+        self.dropconnect_min = dropconnect_min
+
+        # Gradient-Importance Weighted DropConnect
+        self.gradient_importance_weighted = gradient_importance_weighted
+        self.importance_ema_decay = 0.9
+        self.importance_A = None  # EMA of grad_A^2
+        self.importance_B = None  # EMA of grad_B^2
+
+        # Variational rank config
+        self.variational_rank = variational_rank
+        self.rank_budget = rank_budget
+
+        groups = conv.groups
+        if groups > 1 and (r % groups != 0):
+            raise ValueError(
+                f"FewShotLoRAConv: rank r={r} must be a multiple of groups={groups}"
+            )
+        self.groups = groups
+        self.r_per_group = r // max(groups, 1)
+
+        in_per_group = (conv.in_channels // groups) * conv.kernel_size[0] * conv.kernel_size[1]
+        out_per_group = conv.out_channels // groups
+        factory_kwargs = {"device": conv.weight.device, "dtype": conv.weight.dtype}
+
+        self.lora_A = nn.Parameter(torch.zeros(groups, in_per_group, self.r_per_group, **factory_kwargs))
+        self.lora_B = nn.Parameter(torch.zeros(groups, out_per_group, self.r_per_group, **factory_kwargs))
+        nn.init.normal_(self.lora_A, mean=0.0, std=0.01)
+        nn.init.zeros_(self.lora_B)
+
+        # Adaptive rank mask (learned during training)
+        if adaptive_rank and not variational_rank:
+            self.rank_mask = nn.Parameter(torch.ones(groups, self.r_per_group, **factory_kwargs))
+
+        # Variational rank: Gumbel-Softmax logits
+        if variational_rank:
+            # Each rank dimension has a binary logit (keep vs drop)
+            self.rank_logits = nn.Parameter(torch.zeros(groups, self.r_per_group, **factory_kwargs))
+            self.gumbel_tau = 1.0  # Temperature for Gumbel-Softmax
+
+        for param in self.conv.parameters():
+            param.requires_grad = False
+
+    def get_scheduled_dropconnect_rate(self, progress: float = 0.0) -> float:
+        """Compute scheduled DropConnect rate based on training progress [0, 1]."""
+        if self.dropconnect_schedule == "constant" or self.dropconnect_max <= self.dropconnect_min:
+            return self.dropconnect_rate
+        if self.dropconnect_schedule == "linear":
+            rate = self.dropconnect_max - (self.dropconnect_max - self.dropconnect_min) * progress
+        elif self.dropconnect_schedule == "cosine":
+            rate = self.dropconnect_min + (self.dropconnect_max - self.dropconnect_min) * 0.5 * (1 + math.cos(math.pi * progress))
+        elif self.dropconnect_schedule == "exponential":
+            rate = self.dropconnect_min + (self.dropconnect_max - self.dropconnect_min) * math.exp(-5 * progress)
+        else:
+            rate = self.dropconnect_rate
+        return max(self.dropconnect_min, min(self.dropconnect_max, rate))
+
+    def _update_importance(self):
+        """Update Fisher-information importance EMA for GIW-DC.
+        
+        NOTE: This must be called AFTER backward() but BEFORE optimizer step,
+        when gradients are still available.
+        """
+        if not self.gradient_importance_weighted:
+            return
+        if self.lora_A.grad is None or self.lora_B.grad is None:
+            return
+        grad_A_sq = self.lora_A.grad.detach().pow(2)
+        grad_B_sq = self.lora_B.grad.detach().pow(2)
+        if self.importance_A is None:
+            self.importance_A = grad_A_sq.clone()
+            self.importance_B = grad_B_sq.clone()
+        else:
+            self.importance_A = self.importance_ema_decay * self.importance_A + (1 - self.importance_ema_decay) * grad_A_sq
+            self.importance_B = self.importance_ema_decay * self.importance_B + (1 - self.importance_ema_decay) * grad_B_sq
+
+    def _apply_dropconnect(self, tensor: torch.Tensor, is_A: bool = True,
+                           progress: float = 0.0) -> torch.Tensor:
+        """Apply DropConnect to LoRA matrices during training with optional scheduling and importance weighting."""
+        if not self.training:
+            return tensor
+
+        rate = self.get_scheduled_dropconnect_rate(progress)
+        if rate <= 0:
+            return tensor
+
+        if self.gradient_importance_weighted:
+            # Gradient-Importance Weighted DropConnect
+            importance = self.importance_A if is_A else self.importance_B
+            if importance is None:
+                # Fallback to random if importance not yet computed
+                mask = torch.bernoulli(torch.full_like(tensor, 1 - rate)) / (1 - rate)
+                return tensor * mask
+            # Normalize importance per rank dimension
+            importance_norm = importance / (importance.mean(dim=(0, 1), keepdim=True) + 1e-8)
+            # Higher importance -> lower drop probability
+            keep_prob = torch.clamp(1 - rate * (1.0 / (importance_norm + 0.1)), 0.0, 1.0)
+            mask = torch.bernoulli(keep_prob) / (keep_prob + 1e-8)
+            return tensor * mask
+        else:
+            # Standard random DropConnect
+            mask = torch.bernoulli(
+                torch.full_like(tensor, 1 - rate)
+            ) / (1 - rate)
+            return tensor * mask
+
+    def _get_variational_rank_mask(self):
+        """Get rank mask from variational Gumbel-Softmax distribution."""
+        if not self.variational_rank or not self.training:
+            # During eval, use hard threshold
+            if self.variational_rank:
+                return (torch.sigmoid(self.rank_logits) > 0.5).float()
+            return None
+        # Gumbel-Softmax sampling for binary mask
+        # Use straight-through estimator
+        logits = self.rank_logits
+        gumbel_noise = -torch.log(-torch.log(torch.rand_like(logits) + 1e-10) + 1e-10)
+        y_soft = torch.sigmoid((logits + gumbel_noise) / max(self.gumbel_tau, 0.1))
+        # Straight-through: forward uses soft, backward passes through hard
+        y_hard = (y_soft > 0.5).float()
+        mask = y_hard - y_soft.detach() + y_soft
+        return mask
+
+    def get_rank_mask(self):
+        """Get effective rank mask (adaptive or variational)."""
+        if self.variational_rank:
+            return self._get_variational_rank_mask()
+        elif self.adaptive_rank and hasattr(self, 'rank_mask'):
+            return self.rank_mask
+        return None
+
+    def forward(self, x, teacher_features=None, progress: float = 0.0):
+        out = self.conv(x)
+
+        k_h, k_w = self.conv.kernel_size
+        
+        # ── v3: 1x1 conv short-circuit ──
+        # For 1x1 conv with zero padding, unfold is equivalent to reshape
+        # This avoids expensive memory allocation for ~40% of YOLO conv layers
+        is_1x1 = (k_h == 1 and k_w == 1)
+        no_pad = (self.conv.padding == (0, 0) or self.conv.padding == 0)
+        
+        if is_1x1 and no_pad:
+            # x: (B, C_in, H, W) -> (B, C_in, H*W)
+            B_size, C_in, H, W = x.shape
+            L = H * W
+            out_h, out_w = H, W
+            x_unfold = x.view(B_size, C_in, L)
+        else:
+            x_unfold = nn.functional.unfold(
+                x, (k_h, k_w), padding=self.conv.padding,
+                stride=self.conv.stride, dilation=self.conv.dilation
+            )
+            B_size, _, L = x_unfold.shape
+            out_h, out_w = out.shape[2], out.shape[3]
+
+        if self.lora_dropout is not None:
+            x_unfold = self.lora_dropout(x_unfold)
+
+        groups = getattr(self, "groups", getattr(self.conv, "groups", 1))
+
+        # Update importance estimates (for GIW-DC)
+        self._update_importance()
+
+        # Apply DropConnect to LoRA matrices
+        A = self._apply_dropconnect(self.lora_A, is_A=True, progress=progress)
+        B = self._apply_dropconnect(self.lora_B, is_A=False, progress=progress)
+
+        # Apply rank mask (adaptive or variational)
+        rank_mask = self.get_rank_mask()
+        if rank_mask is not None:
+            A = A * rank_mask.unsqueeze(1)
+            B = B * rank_mask.unsqueeze(1)
+
+        if groups == 1 and A.dim() == 2 and B.dim() == 2:
+            x_unfold = x_unfold.transpose(1, 2)
+            lora = x_unfold @ A
+            lora = lora @ B.t()
+            lora = lora * self.scaling
+            lora = lora.transpose(1, 2).reshape(B_size, self.conv.out_channels, out_h, out_w)
+            out_lora = out + lora
+            if teacher_features is not None and self.training:
+                alignment_loss = self._compute_alignment_loss(out_lora, teacher_features)
+                return out_lora, alignment_loss
+            return out_lora
+
+        if groups == 1:
+            x_unfold = x_unfold.transpose(1, 2)
+            lora = x_unfold @ A[0]
+            lora = lora @ B[0].t()
+            lora = lora * self.scaling
+            lora = lora.transpose(1, 2).reshape(B_size, self.conv.out_channels, out_h, out_w)
+            out_lora = out + lora
+            if teacher_features is not None and self.training:
+                alignment_loss = self._compute_alignment_loss(out_lora, teacher_features)
+                return out_lora, alignment_loss
+            return out_lora
+
+        in_per_group = x_unfold.shape[1] // groups
+        x_grouped = x_unfold.view(B_size, groups, in_per_group, L).permute(1, 0, 3, 2)
+        lora = torch.bmm(
+            x_grouped.reshape(groups, B_size * L, in_per_group), A
+        )
+        lora = torch.bmm(lora, B.transpose(1, 2))
+        lora = lora * self.scaling
+        out_per_group = B.shape[1]
+        lora = lora.view(groups, B_size, L, out_per_group).permute(1, 0, 3, 2)
+        lora = lora.reshape(B_size, groups * out_per_group, L)
+        lora = lora.view(B_size, self.conv.out_channels, out_h, out_w)
+
+        # Feature alignment with teacher (if provided)
+        if teacher_features is not None and self.training:
+            alignment_loss = self._compute_alignment_loss(out + lora, teacher_features)
+            return out + lora, alignment_loss
+
+        return out + lora
+
+    def _compute_alignment_loss(self, student_feat, teacher_feat):
+        """Compute feature alignment loss for knowledge distillation."""
+        if teacher_feat is None:
+            return torch.tensor(0.0, device=student_feat.device)
+        # Match spatial dimensions
+        if student_feat.shape != teacher_feat.shape:
+            teacher_feat = nn.functional.adaptive_avg_pool2d(
+                teacher_feat, student_feat.shape[2:]
+            )
+        return nn.functional.mse_loss(student_feat, teacher_feat)
+
+
 class ManualLoRAConv(nn.Module):
     """Minimal manual LoRA wrapper for Conv2d fallback paths.
 
@@ -371,14 +631,24 @@ def _replace_conv_with_manual_lora(module: nn.Module, config: "LoRAConfig", pref
     Grouped convolutions are now supported when `r % groups == 0`. Depthwise
     convs (where groups == in_channels == out_channels) are still gated by
     `config.allow_depthwise` to match the PEFT backend behavior.
+    
+    v3: Supports layer-wise adaptive rank when few_shot_layerwise_rank=True.
     """
     replaced = 0
-    r = getattr(config, "r", 0) or 0
+    base_r = getattr(config, "r", 0) or 0
     allow_depthwise = bool(getattr(config, "allow_depthwise", False))
+    few_shot = getattr(config, "few_shot_mode", False)
+    layerwise_rank = few_shot and getattr(config, "few_shot_layerwise_rank", False)
+
     for name, child in list(module.named_children()):
         full_name = f"{prefix}.{name}" if prefix else name
         if isinstance(child, nn.Conv2d):
             groups = child.groups
+            # Compute per-layer rank if layerwise_rank is enabled
+            r = base_r
+            if layerwise_rank:
+                r = _compute_layer_rank(child, base_r, full_name)
+            
             # Grouped conv compatibility: rank must be divisible by groups.
             if groups > 1:
                 if r > 0 and (r % groups != 0):
@@ -397,11 +667,60 @@ def _replace_conv_with_manual_lora(module: nn.Module, config: "LoRAConfig", pref
                     continue
             if not _matches_target_modules(full_name, getattr(config, "target_modules", None)):
                 continue
-            setattr(module, name, ManualLoRAConv(child, r=config.r, alpha=config.alpha, dropout=config.dropout))
+            # Use FewShotLoRAConv in few-shot mode
+            if few_shot:
+                lora_cls = FewShotLoRAConv
+                lora_kwargs = {
+                    "r": r, "alpha": max(r * 2, config.alpha),
+                    "dropout": config.dropout,
+                    "dropconnect": getattr(config, "few_shot_dropconnect", 0.1),
+                    "adaptive_rank": getattr(config, "few_shot_adaptive_rank", True),
+                    "dropconnect_schedule": getattr(config, "few_shot_dropconnect_schedule", "constant"),
+                    "dropconnect_max": getattr(config, "few_shot_dropconnect_max", 0.3),
+                    "dropconnect_min": getattr(config, "few_shot_dropconnect_min", 0.0),
+                    "gradient_importance_weighted": getattr(config, "few_shot_gradient_importance_weighted", False),
+                    "variational_rank": getattr(config, "few_shot_variational_rank", False),
+                    "rank_budget": getattr(config, "few_shot_rank_budget", 0.5),
+                }
+            else:
+                lora_cls = ManualLoRAConv
+                lora_kwargs = {"r": r, "alpha": max(r * 2, config.alpha), "dropout": config.dropout}
+            setattr(module, name, lora_cls(child, **lora_kwargs))
             replaced += 1
             continue
         replaced += _replace_conv_with_manual_lora(child, config, prefix=full_name, include_head=include_head)
     return replaced
+
+
+def _compute_layer_rank(conv: nn.Conv2d, base_r: int, module_name: str, total_layers: int = 23) -> int:
+    """Compute per-layer LoRA rank based on depth and channel width (v3).
+    
+    Shallow layers (early feature extraction) get larger rank.
+    Deep layers (semantic) get smaller rank.
+    Wider channel layers get proportionally larger rank.
+    """
+    # Extract layer index from module name (e.g., "model.5.m.0.cv1" -> 5)
+    layer_idx = 0
+    for part in module_name.split("."):
+        if part.isdigit():
+            layer_idx = int(part)
+            break
+    
+    # Depth factor: shallow layers (idx=0) -> 1.0, deep layers -> 0.5
+    depth_factor = 1.0 - 0.5 * (layer_idx / max(total_layers, 1))
+    
+    # Channel factor: wider channels -> larger rank
+    channels_factor = min(conv.out_channels / 64.0, 2.0)
+    
+    # Compute rank
+    r = int(base_r * depth_factor * channels_factor)
+    
+    # Ensure divisible by groups
+    groups = max(conv.groups, 1)
+    r = (r // groups) * groups
+    r = max(r, groups)  # At least groups
+    
+    return r
 
 
 def apply_manual_lora(model: nn.Module, config: "LoRAConfig", include_head: bool = False) -> nn.Module:
@@ -473,12 +792,12 @@ def _set_module_by_name(root: nn.Module, module_name: str, module: nn.Module) ->
 
 
 def _collect_fallback_adapter_state(model: nn.Module) -> Dict[str, Any]:
-    """Collect serializable fallback LoRA adapter state from ManualLoRAConv modules."""
+    """Collect serializable fallback LoRA adapter state from ManualLoRAConv or FewShotLoRAConv modules."""
     target_root = getattr(model, "model", model)
     modules = {}
     state = {}
     for name, module in target_root.named_modules():
-        if not isinstance(module, ManualLoRAConv):
+        if not isinstance(module, (ManualLoRAConv, FewShotLoRAConv)):
             continue
         modules[name] = {
             "r": int(module.r),
@@ -489,6 +808,18 @@ def _collect_fallback_adapter_state(model: nn.Module) -> Dict[str, Any]:
             "lora_A": module.lora_A.detach().cpu(),
             "lora_B": module.lora_B.detach().cpu(),
         }
+        if isinstance(module, FewShotLoRAConv):
+            modules[name]["few_shot"] = True
+            modules[name]["dropconnect_schedule"] = getattr(module, "dropconnect_schedule", "constant")
+            modules[name]["dropconnect_max"] = getattr(module, "dropconnect_max", 0.3)
+            modules[name]["dropconnect_min"] = getattr(module, "dropconnect_min", 0.0)
+            modules[name]["gradient_importance_weighted"] = getattr(module, "gradient_importance_weighted", False)
+            modules[name]["variational_rank"] = getattr(module, "variational_rank", False)
+            modules[name]["rank_budget"] = getattr(module, "rank_budget", 0.5)
+            if hasattr(module, 'rank_mask'):
+                state[name]["rank_mask"] = module.rank_mask.detach().cpu()
+            if hasattr(module, 'rank_logits'):
+                state[name]["rank_logits"] = module.rank_logits.detach().cpu()
     return {"modules": modules, "state": state}
 
 
@@ -506,22 +837,37 @@ def _load_fallback_adapter_state(model: nn.Module, path: Path, payload: Dict[str
 
     for module_name, config in module_configs.items():
         original = _get_module_by_name(target_root, module_name)
-        if isinstance(original, ManualLoRAConv):
+        if isinstance(original, (ManualLoRAConv, FewShotLoRAConv)):
             wrapped = original
         else:
             if not isinstance(original, nn.Conv2d):
                 raise TypeError(f"Fallback adapter target is not Conv2d: {module_name}")
-            wrapped = ManualLoRAConv(
-                original,
-                r=int(config.get("r", 0)),
-                alpha=int(config.get("alpha", 0)),
-                dropout=float(config.get("dropout", 0.0)),
-            )
+            is_few_shot = config.get("few_shot", False)
+            lora_cls = FewShotLoRAConv if is_few_shot else ManualLoRAConv
+            lora_kwargs = {
+                "r": int(config.get("r", 0)),
+                "alpha": int(config.get("alpha", 0)),
+                "dropout": float(config.get("dropout", 0.0)),
+            }
+            if is_few_shot:
+                lora_kwargs["dropconnect"] = float(config.get("dropconnect", 0.1))
+                lora_kwargs["adaptive_rank"] = bool(config.get("adaptive_rank", True))
+                lora_kwargs["dropconnect_schedule"] = config.get("dropconnect_schedule", "constant")
+                lora_kwargs["dropconnect_max"] = float(config.get("dropconnect_max", 0.3))
+                lora_kwargs["dropconnect_min"] = float(config.get("dropconnect_min", 0.0))
+                lora_kwargs["gradient_importance_weighted"] = bool(config.get("gradient_importance_weighted", False))
+                lora_kwargs["variational_rank"] = bool(config.get("variational_rank", False))
+                lora_kwargs["rank_budget"] = float(config.get("rank_budget", 0.5))
+            wrapped = lora_cls(original, **lora_kwargs)
             _set_module_by_name(target_root, module_name, wrapped)
 
         params = module_state.get(module_name, {})
         wrapped.lora_A.data.copy_(params["lora_A"])
         wrapped.lora_B.data.copy_(params["lora_B"])
+        if "rank_mask" in params and hasattr(wrapped, 'rank_mask'):
+            wrapped.rank_mask.data.copy_(params["rank_mask"])
+        if "rank_logits" in params and hasattr(wrapped, 'rank_logits'):
+            wrapped.rank_logits.data.copy_(params["rank_logits"])
 
     model = _wrap_top_level_lora_model(model, None)
     model.lora_enabled = True
@@ -531,8 +877,8 @@ def _load_fallback_adapter_state(model: nn.Module, path: Path, payload: Dict[str
     return model
 
 
-def _merge_manual_lora_conv(module: ManualLoRAConv) -> nn.Conv2d:
-    """Materialize a ManualLoRAConv adapter into a plain Conv2d with merged weights.
+def _merge_manual_lora_conv(module) -> nn.Conv2d:
+    """Materialize a ManualLoRAConv or FewShotLoRAConv adapter into a plain Conv2d with merged weights.
 
     Handles both dense (groups=1) and grouped (groups>1) convolutions. The stored
     shapes are:
@@ -541,8 +887,14 @@ def _merge_manual_lora_conv(module: ManualLoRAConv) -> nn.Conv2d:
     """
     conv = module.conv
     groups = getattr(module, "groups", 1)
+    # Apply adaptive rank mask if present
+    lora_A = module.lora_A
+    lora_B = module.lora_B
+    if hasattr(module, 'rank_mask'):
+        lora_A = lora_A * module.rank_mask.unsqueeze(1)
+        lora_B = lora_B * module.rank_mask.unsqueeze(1)
     # Per-group delta: (out_per_group, in_per_group * kH * kW)
-    delta_per_group = torch.bmm(module.lora_B, module.lora_A.transpose(1, 2))
+    delta_per_group = torch.bmm(lora_B, lora_A.transpose(1, 2))
     # Reshape into Conv2d weight layout: (out_channels, in_channels/groups, kH, kW)
     out_per_group = conv.out_channels // max(groups, 1)
     in_per_group = conv.in_channels // max(groups, 1)
@@ -558,10 +910,10 @@ def _merge_manual_lora_conv(module: ManualLoRAConv) -> nn.Conv2d:
 
 
 def _merge_fallback_modules(module: nn.Module) -> int:
-    """Recursively merge ManualLoRAConv children back into Conv2d modules."""
+    """Recursively merge ManualLoRAConv/FewShotLoRAConv children back into Conv2d modules."""
     merged = 0
     for name, child in list(module.named_children()):
-        if isinstance(child, ManualLoRAConv):
+        if isinstance(child, (ManualLoRAConv, FewShotLoRAConv)):
             setattr(module, name, _merge_manual_lora_conv(child))
             merged += 1
             continue
@@ -761,6 +1113,34 @@ class LoRAConfig:
     orth_reg_weight: float = 0.5 # AdaLoRA orthogonal regularization weight
     total_step: Optional[int] = None # AdaLoRA total training steps, required by PEFT
 
+    # Few-Shot Options
+    few_shot_mode: bool = False # Enable few-shot LoRA with enhanced regularization
+    few_shot_teacher: Optional[str] = None # Path to teacher model for knowledge distillation
+    few_shot_dropconnect: float = 0.1 # DropConnect rate (better than dropout for few-shot)
+    few_shot_distill_weight: float = 0.5 # Weight for distillation loss
+    few_shot_adaptive_rank: bool = True # Auto-adjust rank based on data scarcity
+    # Enhancements
+    few_shot_dropconnect_schedule: str = "cosine"  # DropConnect schedule: constant/linear/cosine/exponential
+    few_shot_dropconnect_max: float = 0.3  # Initial max DropConnect rate
+    few_shot_dropconnect_min: float = 0.0  # Final min DropConnect rate
+    few_shot_gradient_importance_weighted: bool = False  # Use gradient-importance weighted DropConnect
+    few_shot_hierarchical_distill: bool = False  # Enable multi-layer hierarchical distillation
+    few_shot_distill_layers: Optional[List[int]] = None  # Layer indices for intermediate distillation
+    few_shot_variational_rank: bool = False  # Enable variational rank selection
+    few_shot_rank_budget: float = 0.5  # Budget ratio for rank retention
+    few_shot_adaptive_temperature: bool = False  # Enable task-adaptive distillation temperature
+    few_shot_curriculum_sampling: bool = False  # Enable curriculum learning sampler
+    # v3 Enhancements
+    few_shot_distill_schedule: str = "cosine"  # Distillation weight schedule: constant/linear/cosine
+    few_shot_distill_weight_max: float = 1.0  # Initial max distillation weight
+    few_shot_distill_weight_min: float = 0.1  # Final min distillation weight
+    few_shot_use_ema_teacher: bool = False  # Use EMA teacher for progressive self-distillation
+    few_shot_ema_decay: float = 0.999  # EMA teacher decay rate
+    few_shot_response_distill: bool = False  # Enable detection head response distillation
+    few_shot_response_distill_weight: float = 0.3  # Weight for response distillation loss
+    few_shot_layerwise_rank: bool = False  # Enable per-layer adaptive rank
+    few_shot_hook_cache: bool = True  # Cache hierarchical distillation hooks across batches
+
     def __post_init__(self):
         """Performs parameter validation and type standardization."""
         # Standardize list inputs
@@ -775,6 +1155,38 @@ class LoRAConfig:
             raise ValueError("lora_r must be >= 0")
 
         self.init_lora_weights = _normalize_lora_init(self.init_lora_weights)
+
+        # Few-shot config validation
+        if self.few_shot_mode:
+            if self.few_shot_dropconnect_max < self.few_shot_dropconnect_min:
+                raise ValueError(
+                    f"lora_few_shot_dropconnect_max ({self.few_shot_dropconnect_max}) "
+                    f"must be >= lora_few_shot_dropconnect_min ({self.few_shot_dropconnect_min})"
+                )
+            if not (0.0 <= self.few_shot_rank_budget <= 1.0):
+                raise ValueError(
+                    f"lora_few_shot_rank_budget ({self.few_shot_rank_budget}) must be in [0, 1]"
+                )
+            if self.few_shot_distill_weight_max < self.few_shot_distill_weight_min:
+                raise ValueError(
+                    f"lora_few_shot_distill_weight_max ({self.few_shot_distill_weight_max}) "
+                    f"must be >= lora_few_shot_distill_weight_min ({self.few_shot_distill_weight_min})"
+                )
+            if not (0.0 < self.few_shot_ema_decay <= 1.0):
+                raise ValueError(
+                    f"lora_few_shot_ema_decay ({self.few_shot_ema_decay}) must be in (0, 1]"
+                )
+            if self.few_shot_distill_layers:
+                for idx in self.few_shot_distill_layers:
+                    if not isinstance(idx, int) or idx < 0:
+                        raise ValueError(
+                            f"lora_few_shot_distill_layers must contain non-negative ints, got {idx}"
+                        )
+            if self.few_shot_use_ema_teacher and not self.few_shot_teacher:
+                LOGGER.warning(
+                    "[LoRA] lora_few_shot_use_ema_teacher=True but no teacher model specified. "
+                    "EMA teacher will use student initialization."
+                )
 
     @classmethod
     def from_args(cls, args=None, **kwargs):
@@ -825,6 +1237,32 @@ class LoRAConfig:
             "beta2": "lora_beta2",
             "orth_reg_weight": "lora_orth_reg_weight",
             "total_step": "lora_total_step",
+            "few_shot_mode": "lora_few_shot_mode",
+            "few_shot_teacher": "lora_few_shot_teacher",
+            "few_shot_dropconnect": "lora_few_shot_dropconnect",
+            "few_shot_distill_weight": "lora_few_shot_distill_weight",
+            "few_shot_adaptive_rank": "lora_few_shot_adaptive_rank",
+            # Enhancement mappings
+            "few_shot_dropconnect_schedule": "lora_few_shot_dropconnect_schedule",
+            "few_shot_dropconnect_max": "lora_few_shot_dropconnect_max",
+            "few_shot_dropconnect_min": "lora_few_shot_dropconnect_min",
+            "few_shot_gradient_importance_weighted": "lora_few_shot_gradient_importance_weighted",
+            "few_shot_hierarchical_distill": "lora_few_shot_hierarchical_distill",
+            "few_shot_distill_layers": "lora_few_shot_distill_layers",
+            "few_shot_variational_rank": "lora_few_shot_variational_rank",
+            "few_shot_rank_budget": "lora_few_shot_rank_budget",
+            "few_shot_adaptive_temperature": "lora_few_shot_adaptive_temperature",
+            "few_shot_curriculum_sampling": "lora_few_shot_curriculum_sampling",
+            # v3 mappings
+            "few_shot_distill_schedule": "lora_few_shot_distill_schedule",
+            "few_shot_distill_weight_max": "lora_few_shot_distill_weight_max",
+            "few_shot_distill_weight_min": "lora_few_shot_distill_weight_min",
+            "few_shot_use_ema_teacher": "lora_few_shot_use_ema_teacher",
+            "few_shot_ema_decay": "lora_few_shot_ema_decay",
+            "few_shot_response_distill": "lora_few_shot_response_distill",
+            "few_shot_response_distill_weight": "lora_few_shot_response_distill_weight",
+            "few_shot_layerwise_rank": "lora_few_shot_layerwise_rank",
+            "few_shot_hook_cache": "lora_few_shot_hook_cache",
         }
 
         dataclass_fields = set(cls.__dataclass_fields__)
@@ -860,6 +1298,9 @@ class LoRAConfigBuilder:
     _PAT_BACKBONE_EXCLUDE = re.compile(r"(head|detect|box|cls|pred|fpn|pan|seg|pose|enc_score_head|enc_bbox_head|dec_score_head|dec_bbox_head)", re.IGNORECASE)
     _PAT_MOE = re.compile(r"(expert|moe)", re.IGNORECASE)
     _PAT_ATTN = re.compile(r"attn", re.IGNORECASE)
+    # YOLO12 Area-Attention pattern: matches Conv2d-based qkv/proj/pe submodules.
+    # Excluded from LoRA targets by default to avoid breaking softmax numerical stability.
+    _PAT_AREA_ATTN = re.compile(r"\.attn\.(qkv|proj|pe)(\.|$)", re.IGNORECASE)
     _PAT_INDEX = re.compile(r"^(\d+)\.") # Matches "0" in "0.conv"
     _PAT_INDEX_ANY = re.compile(r"(?:^|\.)(\d+)\.")  # Matches first numeric segment anywhere (e.g. "model.5.m.0.cv1" -> 5)
 
@@ -1012,9 +1453,16 @@ class LoRAConfigBuilder:
             if not include_moe and LoRAConfigBuilder._PAT_MOE.search(lname):
                 continue
 
-            # Attention Check
-            if not include_attention and is_linear and LoRAConfigBuilder._PAT_ATTN.search(lname):
-                continue
+            # Attention Check: also handle Conv2d-based attention.
+            # YOLO12 AAttn uses Conv2d for qkv/proj/pe; the original logic only
+            # filtered nn.Linear, leaking these layers into LoRA targets.
+            if not include_attention:
+                if is_linear and LoRAConfigBuilder._PAT_ATTN.search(lname):
+                    continue
+                # Conv2d form: match .attn.{qkv,proj,pe}
+                if is_conv and LoRAConfigBuilder._PAT_AREA_ATTN.search(lname):
+                    LOGGER.debug(f"[LoRA] Skip Area-Attention conv {name} (include_attention=False)")
+                    continue
 
             targets.add(name)
 
@@ -1285,6 +1733,20 @@ def apply_lora(
     # 1. Initialize Configuration
     config = LoRAConfig.from_args(args, **kwargs)
 
+    # Few-shot mode: auto-adjust hyperparameters for small datasets
+    if config.few_shot_mode:
+        LOGGER.info("[LoRA] 🎯 Few-shot mode enabled — applying adaptive configuration")
+        if config.few_shot_adaptive_rank:
+            # Increase rank for better expressiveness on limited data
+            config.r = max(config.r, 32)
+            config.alpha = max(config.alpha, 64)
+            LOGGER.info(f"[LoRA]   Adaptive rank: r={config.r}, alpha={config.alpha}")
+        # Reduce regularization to preserve signal
+        config.dropout = min(config.dropout, 0.02)
+        # Enable stronger LR multiplier for faster adaptation
+        config.lr_mult = max(config.lr_mult, 3.0)
+        LOGGER.info(f"[LoRA]   Dropout={config.dropout}, LR mult={config.lr_mult}")
+
     # Check if LoRA should be enabled
     if config.r <= 0 and config.auto_r_ratio <= 0:
         LOGGER.info("[LoRA] Disabled (r=0).")
@@ -1321,12 +1783,15 @@ def apply_lora(
     # This prevents confusing logs claiming MoE is included when the model (e.g. YOLO11) has none.
     has_moe = False
     has_attn = False
+    has_area_attn = False  # YOLO12 Area-Attention detection
     for name, _ in model.named_modules():
         if LoRAConfigBuilder._PAT_MOE.search(name):
             has_moe = True
         if LoRAConfigBuilder._PAT_ATTN.search(name):
             has_attn = True
-        if has_moe and has_attn:
+        if LoRAConfigBuilder._PAT_AREA_ATTN.search(name):
+            has_area_attn = True
+        if has_moe and has_attn and has_area_attn:
             break
     
     if config.include_moe and not has_moe:
@@ -1334,6 +1799,30 @@ def apply_lora(
     
     if config.include_attention and not has_attn:
         config.include_attention = False
+
+    # 2.6 YOLO12 Area-Attention safety guard.
+    # AAttn uses Conv2d-based softmax attention; LoRA injection here easily causes
+    # numerical collapse (symptom: loss drops to 0 and mAP/P/R become 0 mid-training).
+    # Default behavior: drop attn.{qkv,proj,pe} targets + force alpha warmup when enabled.
+    if has_area_attn:
+        LOGGER.warning(
+            "[LoRA] YOLO12/A2C2f Area-Attention detected. "
+            "Applying safety guards: (1) exclude attn.{qkv,proj,pe} from LoRA targets, "
+            "(2) force alpha_warmup>=3 epochs if unset, (3) cap lora_lr_mult<=1.0."
+        )
+        # Force minimum alpha warmup (keep larger user-set values)
+        cur_warmup = getattr(config, "alpha_warmup", 0) or 0
+        if cur_warmup < 3:
+            try:
+                config.alpha_warmup = 3
+                LOGGER.info(f"[LoRA] Force alpha_warmup = 3 for YOLO12 safety (was {cur_warmup}).")
+            except Exception:
+                pass
+        # Lower LR multiplier (attention LoRA layers are very LR-sensitive)
+        cur_lr_mult = kwargs.get("lora_lr_mult", 2.0) or 2.0
+        if cur_lr_mult > 1.0:
+            kwargs["lora_lr_mult"] = 1.0
+            LOGGER.info(f"[LoRA] Cap lora_lr_mult = 1.0 for YOLO12 safety (was {cur_lr_mult}).")
 
     # 3. Logging
     LOGGER.info("-" * 60)

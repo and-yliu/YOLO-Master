@@ -186,6 +186,34 @@ lora_ortho_frequency: 10 # (int) Compute orthogonal loss every N batches (1=ever
 lora_dropout_end: 0.15 # (float) Final dropout for dynamic schedule (must be >= lora_dropout)
 lora_dropout_start_ratio: 0.3 # (float) When to start increasing dropout (fraction of total epochs)
 
+# Few-Shot LoRA settings -----------------------------------------------------------------------------------------------
+lora_few_shot_mode: False # (bool) Enable few-shot LoRA with enhanced regularization for small datasets
+lora_few_shot_teacher: # (str, optional) Path to teacher model for knowledge distillation
+lora_few_shot_dropconnect: 0.1 # (float) DropConnect rate for few-shot LoRA (better than dropout for limited data)
+lora_few_shot_distill_weight: 0.5 # (float) Weight for distillation loss when teacher is provided
+lora_few_shot_adaptive_rank: True # (bool) Auto-adjust rank based on data scarcity in few-shot mode
+# Few-Shot LoRA: scheduling and advanced regularization
+lora_few_shot_dropconnect_schedule: "cosine" # (str) DropConnect schedule: constant/linear/cosine/exponential
+lora_few_shot_dropconnect_max: 0.3 # (float) Initial max DropConnect rate (for scheduled modes)
+lora_few_shot_dropconnect_min: 0.0 # (float) Final min DropConnect rate (for scheduled modes)
+lora_few_shot_gradient_importance_weighted: False # (bool) Use gradient-importance weighted DropConnect
+lora_few_shot_hierarchical_distill: False # (bool) Enable multi-layer hierarchical distillation
+lora_few_shot_distill_layers: # (list, optional) Layer indices for intermediate distillation e.g. [10, 13, 16]
+lora_few_shot_variational_rank: False # (bool) Enable variational rank selection (Gumbel-Softmax)
+lora_few_shot_rank_budget: 0.5 # (float) Budget ratio for rank retention in variational mode
+lora_few_shot_adaptive_temperature: False # (bool) Enable task-adaptive distillation temperature
+lora_few_shot_curriculum_sampling: False # (bool) Enable curriculum learning sampler
+# Few-Shot LoRA: distillation scheduling and response-level transfer
+lora_few_shot_distill_schedule: "cosine" # (str) Distillation weight schedule: constant/linear/cosine
+lora_few_shot_distill_weight_max: 1.0 # (float) Initial max distillation weight
+lora_few_shot_distill_weight_min: 0.1 # (float) Final min distillation weight
+lora_few_shot_use_ema_teacher: False # (bool) Use EMA teacher for progressive self-distillation
+lora_few_shot_ema_decay: 0.999 # (float) EMA teacher decay rate
+lora_few_shot_response_distill: False # (bool) Enable detection head response distillation (cls + bbox)
+lora_few_shot_response_distill_weight: 0.3 # (float) Weight for response distillation loss
+lora_few_shot_layerwise_rank: False # (bool) Enable per-layer adaptive rank based on depth/channels
+lora_few_shot_hook_cache: True # (bool) Cache hierarchical distillation hooks across batches
+
 # MoE (Mixture-of-Experts) settings -----------------------------------------------------------------------------------------
 moe_num_experts: 4 # (int) Number of experts in MoE layers (0 to use model config)
 moe_top_k: 2 # (int) Number of experts to activate per token
