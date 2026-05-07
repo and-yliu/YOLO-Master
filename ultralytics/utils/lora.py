@@ -91,17 +91,36 @@ def _compute_param_stats(model: nn.Module) -> ParamStats:
 
 
 def _unfreeze_detection_head(model: nn.Module) -> int:
-    """Unfreeze detection head parameters (detect/cv2/cv3/dfl). Returns count of unfrozen params."""
+    """Unfreeze detection head parameters for YOLO (detect/cv2/cv3/dfl) and RT-DETR (decoder/score_head/bbox_head/etc.).
+    
+    RT-DETR uses RTDETRDecoder with parameter names like decoder.layers, dec_score_head,
+    dec_bbox_head, enc_score_head, enc_bbox_head, input_proj, query_pos_head, 
+    denoising_class_embed, enc_output — none of which match the YOLO keywords.
+    If the head stays frozen during LoRA training, mAP will be zero because the model
+    cannot learn class/box predictions for the new dataset.
+    
+    Returns count of unfrozen params.
+    """
     head_unfrozen = 0
+    # YOLO-series head keywords
+    yolo_keys = ("detect", "cv2", "cv3", "dfl")
+    # RT-DETR head keywords (model.28.xxx)
+    rtdetr_keys = (
+        "decoder", "dec_score_head", "dec_bbox_head",
+        "enc_score_head", "enc_bbox_head", "input_proj",
+        "query_pos_head", "denoising_class_embed", "enc_output",
+    )
+    head_keys = yolo_keys + rtdetr_keys
+    
     for name, param in model.named_parameters():
-        if any(k in name for k in ("detect", "cv2", "cv3", "dfl")):
+        if any(k in name for k in head_keys):
             if not param.requires_grad:
                 param.requires_grad = True
                 head_unfrozen += param.numel()
     if head_unfrozen > 0:
         LOGGER.info(
-            f"[LoRA] 🔓 Unfrozen {head_unfrozen:,} detection head parameters "
-            f"(detect/cv2/cv3/dfl) due to class-mismatch re-initialization."
+            f"[LoRA] Unfrozen {head_unfrozen:,} detection head parameters "
+            f"due to class-mismatch re-initialization."
         )
     return head_unfrozen
 
