@@ -43,6 +43,15 @@ except ImportError:
 _REGEX_INT = re.compile(r"-?\d+")
 _REGEX_SPLIT = re.compile(r"[,;]\s*")  # Supports comma or semicolon delimiters
 
+# PEFT adapter parameter name prefixes for all supported variants.
+# Used to identify adapter parameters in named_parameters() for stats and optimizer grouping.
+_PEFT_ADAPTER_PREFIXES = ("lora_", "hada_", "lokr_", "oft_", "boft_", "ia3_", "hra_")
+
+
+def _is_adapter_param(name: str) -> bool:
+    """Check if a parameter name belongs to a PEFT adapter (any supported variant)."""
+    return any(p in name for p in _PEFT_ADAPTER_PREFIXES)
+
 def _fast_parse_int_list(value: Any) -> Optional[List[int]]:
     """
     High-performance integer list parser.
@@ -2402,7 +2411,7 @@ def _print_param_stats(model: nn.Module):
             trainable_params += param.numel()
         else:
             frozen_base += param.numel()
-        if "lora_" in name:
+        if _is_adapter_param(name):
             lora_params += param.numel()
 
     pct = 100 * trainable_params / all_params if all_params > 0 else 0
@@ -2412,7 +2421,7 @@ def _print_param_stats(model: nn.Module):
     LOGGER.info(f"[LoRA] 📊 Stats: "
                 f"Trainable: {trainable_params:,} ({pct:.3f}%) | "
                 f"Frozen Base: {frozen_base:,} | "
-                f"LoRA Params: {lora_params:,} ({lora_pct:.3f}%) | "
+                f"Adapter Params: {lora_params:,} ({lora_pct:.3f}%) | "
                 f"Base Total: {base_total:,}")
 
     if trainable_params == all_params:
@@ -2456,7 +2465,7 @@ def get_lora_param_groups(
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        if "lora_" in name:
+        if _is_adapter_param(name):
             lora_params.append(param)
         else:
             other_params.append(param)
@@ -2838,7 +2847,7 @@ class LoraTrainingStrategy:
             pg_has_lora = False
             for p in pg.get("params", []):
                 name = name_by_id.get(id(p))
-                if name is not None and "lora_" in name:
+                if name is not None and _is_adapter_param(name):
                     pg_has_lora = True
                     lora_params_in_pg.append((name, p, idx))
             if pg_has_lora and base_lr is None:
@@ -3378,7 +3387,7 @@ def get_lora_training_stats(model, svd_sample_ratio: float = 0.2, svd_max_layers
             stats['trainable_params'] += param.numel()
         else:
             stats['frozen_params'] += param.numel()
-        if "lora_" in name:
+        if _is_adapter_param(name):
             stats['lora_params'] += param.numel()
 
     # First pass: collect LoRA modules and cheap stats (Frobenius norms).
