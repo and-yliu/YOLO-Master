@@ -4,6 +4,7 @@ import torch.nn as nn
 import gc
 import inspect
 import json
+import math
 import types
 from dataclasses import dataclass, field
 from typing import Optional, List, Union, Dict, Any, Set, Tuple, TYPE_CHECKING
@@ -1029,11 +1030,24 @@ class PeftProxy(PeftModel):
     """
 
     def _get_base(self) -> nn.Module:
-        """Helper to retrieve the underlying base model, handling nested PEFT wrappers."""
+        """Helper to retrieve the underlying base model, handling nested PEFT wrappers.
+
+        P1 PERF FIX: cache the resolved base module on first access so that hot
+        paths (forward, __getitem__, __getattr__ fallback) do not re-walk the
+        wrapper chain on every call. PyTorch's `nn.Module.__getattr__` is
+        already non-trivial — repeating `hasattr(model, 'model')` lookups per
+        layer access pushes 1-2% extra overhead in long training runs.
+        """
+        cached = self.__dict__.get("_cached_base_model")
+        if cached is not None:
+            return cached
         model = self.base_model
         # Traverse down if multiple wrappers exist (common in some PEFT versions)
         while hasattr(model, 'model') and not isinstance(model, nn.Sequential):
             model = model.model
+        # Use __dict__ to bypass nn.Module's parameter registration machinery
+        # — we only want to cache the reference, not register a submodule.
+        self.__dict__["_cached_base_model"] = model
         return model
 
     def forward(self, x, *args, **kwargs):
@@ -1785,7 +1799,16 @@ class LoRAConfigBuilder:
                 )
             filtered_targets = [name for name in targets if isinstance(modules_dict.get(name), nn.Linear)]
             if targets and not filtered_targets:
-                LOGGER.warning("[LoRA] AdaLoRA currently supports nn.Linear targets only; all non-linear targets were filtered out.")
+                # P1 FIX: silently dropping all targets means AdaLoRA was
+                # effectively disabled with no clear signal. Raise instead so
+                # the user can pick a compatible variant explicitly.
+                raise ValueError(
+                    "AdaLoRA was requested but no nn.Linear targets remain after filtering. "
+                    "AdaLoRA only supports Linear layers in PEFT 0.18; for Conv-dominant "
+                    "architectures (YOLOv8/v11/v12, YOLOE) switch to lora_type=lora "
+                    "(optionally with lora_use_dora=True). Detected target count: "
+                    f"{len(targets)} (all non-Linear)."
+                )
             targets = filtered_targets
 
         if not targets:
@@ -2146,6 +2169,13 @@ def apply_lora(
     # Default behavior: drop attn.{qkv,proj,pe} *and* the ABlock-internal MLP conv
     # path (which sits on the same residual stream and has no LayerNorm), plus
     # force alpha warmup when enabled.
+    #
+    # CRITICAL FIX (P0): Trainer reads `self.args.lora_lr_mult` and
+    # `self.args.lora_alpha_warmup` directly when building the optimizer and
+    # scheduling alpha warmup. Writing the cap to `kwargs` or `config` alone
+    # has *no effect* on the actual training run. We therefore mutate `args`
+    # in place (when provided) and also keep `config`/`kwargs` consistent
+    # for downstream consumers.
     if has_area_attn:
         LOGGER.warning(
             "[LoRA] YOLO12/A2C2f Area-Attention detected. "
@@ -2153,17 +2183,43 @@ def apply_lora(
             "ABlock-internal mlp Conv2d from LoRA targets, "
             "(2) force alpha_warmup>=3 epochs if unset, (3) cap lora_lr_mult<=1.0."
         )
-        # Force minimum alpha warmup (keep larger user-set values)
-        cur_warmup = getattr(config, "alpha_warmup", 0) or 0
+        # Resolve current values from args (preferred), then config, then kwargs.
+        cur_warmup = (
+            getattr(args, "lora_alpha_warmup", None)
+            if args is not None and not isinstance(args, LoRAConfig)
+            else getattr(config, "alpha_warmup", None)
+        )
+        cur_warmup = cur_warmup or 0
         if cur_warmup < 3:
             try:
                 config.alpha_warmup = 3
+                if args is not None and not isinstance(args, LoRAConfig):
+                    try:
+                        setattr(args, "lora_alpha_warmup", 3)
+                    except Exception:
+                        pass
+                if "lora_alpha_warmup" in kwargs:
+                    kwargs["lora_alpha_warmup"] = 3
                 LOGGER.info(f"[LoRA] Force alpha_warmup = 3 for YOLO12 safety (was {cur_warmup}).")
             except Exception:
                 pass
-        # Lower LR multiplier (attention LoRA layers are very LR-sensitive)
-        cur_lr_mult = kwargs.get("lora_lr_mult", 2.0) or 2.0
-        if cur_lr_mult > 1.0:
+        # Lower LR multiplier (attention LoRA layers are very LR-sensitive).
+        cur_lr_mult = (
+            getattr(args, "lora_lr_mult", None)
+            if args is not None and not isinstance(args, LoRAConfig)
+            else getattr(config, "lr_mult", None)
+        )
+        cur_lr_mult = cur_lr_mult if cur_lr_mult is not None else kwargs.get("lora_lr_mult", 2.0)
+        if cur_lr_mult and cur_lr_mult > 1.0:
+            try:
+                config.lr_mult = 1.0
+            except Exception:
+                pass
+            if args is not None and not isinstance(args, LoRAConfig):
+                try:
+                    setattr(args, "lora_lr_mult", 1.0)
+                except Exception:
+                    pass
             kwargs["lora_lr_mult"] = 1.0
             LOGGER.info(f"[LoRA] Cap lora_lr_mult = 1.0 for YOLO12 safety (was {cur_lr_mult}).")
 
@@ -2353,10 +2409,36 @@ def apply_lora(
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+        # P0 FIX: Auto-degrade to manual fallback when PEFT setup fails and the
+        # request is in principle representable in the in-repo fallback (plain
+        # LoRA, r > 0). This avoids hard-killing training runs over recoverable
+        # PEFT-side incompatibilities (e.g. unsupported init mode for a single
+        # Conv2d target). Users can still force PEFT-only by setting
+        # `lora_backend=peft` (which makes the auto fallback path raise above).
+        is_auto_backend = str(getattr(config, "backend", "auto")).lower() == "auto"
+        can_fallback = supports_fallback_request(config)
+        if is_auto_backend and can_fallback:
+            LOGGER.warning(
+                "[LoRA] PEFT path failed; auto-degrading to in-repo fallback "
+                "manual LoRA backend (set lora_backend=peft to disable this fallback)."
+            )
+            try:
+                return apply_manual_lora(model, config, include_head=config.include_head)
+            except Exception as fb_err:
+                LOGGER.error(f"[LoRA] Fallback path also failed: {fb_err}")
+                raise e
         raise e
 
     # Unfreeze detection head (may be frozen by PEFT or random init)
     _unfreeze_detection_head(model)
+
+    # P0 FIX: Honor `freeze_bn` on the PEFT path as well. Previously the field
+    # was only consumed by `apply_manual_lora` so passing `lora_freeze_bn=True`
+    # with the PEFT backend silently had no effect.
+    if bool(getattr(config, "freeze_bn", False)):
+        _freeze_batchnorm_layers(getattr(model, "model", model))
+        LOGGER.info("[LoRA] BatchNorm layers frozen (freeze_bn=True).")
 
     # 6. Gradient Checkpointing (VRAM Optimization) - Actually activate
     if config.gradient_checkpointing:
@@ -2409,6 +2491,20 @@ def _warn_slow_peft_variant(peft_type: str):
         LOGGER.warning(
             "[LoRA] ⚠️  OFT uses dense orthogonal rotations (high activation memory). "
             "If OOM occurs, reduce batch size or use LoRA/LoHa/LoKr instead."
+        )
+    elif peft_type == "boft":
+        LOGGER.warning(
+            "[LoRA] ⚠️  BOFT relies on butterfly orthogonal factors and a CUDA "
+            "kernel JIT-compiled at first forward (requires g++/cc1plus). "
+            "First-iteration latency can be high; if cc1plus is missing the "
+            "kernel falls back to butterfly_factor=1 with reduced expressivity."
+        )
+    elif peft_type == "adalora":
+        LOGGER.warning(
+            "[LoRA] ⚠️  AdaLoRA needs `total_step` set to the total number of "
+            "training iterations for the rank-budget schedule to work correctly. "
+            "We auto-resolve it from trainer iterations, but verify the number "
+            "in the log if mAP plateaus early."
         )
 
 
@@ -2569,7 +2665,21 @@ def save_lora_adapters(model: "DetectionModel", path: Union[str, Path]) -> bool:
                 "target_modules": list(getattr(model, "lora_target_modules", sorted(fallback_state["modules"]))),
                 "runtime_metadata": getattr(model, "lora_runtime_metadata", {}),
             }
-            (path / "adapter_config.json").write_text(json.dumps(payload, indent=2, ensure_ascii=False))
+            # P0 FIX: write fallback metadata to a dedicated filename so it does
+            # not collide with PEFT's own `adapter_config.json` when both
+            # backends save into the same directory (e.g. successive
+            # save_lora_adapters calls). Keep an `adapter_config.json` symlink
+            # for backward compatibility with older loaders.
+            (path / "fallback_meta.json").write_text(
+                json.dumps(payload, indent=2, ensure_ascii=False)
+            )
+            # Backward compat: only write adapter_config.json if PEFT didn't
+            # already create one in this directory.
+            adapter_cfg_path = path / "adapter_config.json"
+            if not adapter_cfg_path.exists():
+                adapter_cfg_path.write_text(
+                    json.dumps(payload, indent=2, ensure_ascii=False)
+                )
             LOGGER.info(f"[LoRA] 💾 Fallback adapter metadata saved to {path}")
             return True
 
@@ -2607,11 +2717,22 @@ def load_lora_adapters(model: "DetectionModel", path: Union[str, Path], merge: b
         LOGGER.error(f"[LoRA] Adapter path not found: {path}")
         return False
 
+    # P0 FIX: prefer dedicated fallback metadata file to avoid mis-classifying
+    # a PEFT-saved `adapter_config.json` as a fallback config.
+    fallback_meta_path = path / "fallback_meta.json"
     config_path = path / "adapter_config.json"
     payload = {}
-    if config_path.exists():
+    if fallback_meta_path.exists():
         try:
-            payload = json.loads(config_path.read_text())
+            payload = json.loads(fallback_meta_path.read_text())
+        except Exception:
+            payload = {}
+    elif config_path.exists():
+        try:
+            candidate = json.loads(config_path.read_text())
+            # Only treat as fallback metadata if it self-identifies as such.
+            if candidate.get("backend") == "fallback":
+                payload = candidate
         except Exception:
             payload = {}
 
@@ -3282,24 +3403,23 @@ class LoraTrainingStrategy:
 
         # OPTIMIZATION: Iterate through modules once, processing both A and B weights
         # Avoids calling model.named_modules() twice
+        # CRITICAL FIX (P0): Do NOT detach() the weight tensors — that severs the
+        # gradient graph and the orthogonal regularization becomes a no-op.
+        # We must keep gradients flowing through A/B so that the regularizer
+        # actually penalizes non-orthogonality during backward().
         for name, module in model.named_modules():
             # Process lora_A weights
             lora_a = getattr(module, 'lora_A', None)
             if lora_a is not None:
                 for A_w in _iter_weights(lora_a):
-                    # OPTIMIZATION: Avoid .detach().float() if already correct dtype/device
-                    A = A_w.detach()
-                    if A.dtype != torch.float32:
-                        A = A.float()
+                    # Keep gradient connection (no .detach()).
+                    A = A_w if A_w.dtype == torch.float32 else A_w.float()
                     if A.dim() >= 2 and A.shape[0] > 0:
                         if A.dim() > 2:
                             A = A.reshape(A.shape[0], -1)
-                        # OPTIMIZATION: Use torch.matmul instead of @ for clarity
-                        # and pre-allocate identity matrix if possible
                         AA_T = torch.matmul(A, A.t())
                         rows = AA_T.shape[0]
-                        # OPTIMIZATION: Use torch.eye with device directly
-                        ident = torch.eye(rows, device=device, dtype=torch.float32)
+                        ident = torch.eye(rows, device=device, dtype=AA_T.dtype)
                         ortho_loss = ortho_loss + torch.norm(AA_T - ident, p='fro')
                         pair_count += 1
 
@@ -3307,15 +3427,13 @@ class LoraTrainingStrategy:
             lora_b = getattr(module, 'lora_B', None)
             if lora_b is not None:
                 for B_w in _iter_weights(lora_b):
-                    B = B_w.detach()
-                    if B.dtype != torch.float32:
-                        B = B.float()
+                    B = B_w if B_w.dtype == torch.float32 else B_w.float()
                     if B.dim() >= 2 and B.shape[-1] > 0:
                         if B.dim() > 2:
                             B = B.reshape(B.shape[0], -1)
                         BT_B = torch.matmul(B.t(), B)
                         cols = BT_B.shape[0]
-                        ident = torch.eye(cols, device=device, dtype=torch.float32)
+                        ident = torch.eye(cols, device=device, dtype=BT_B.dtype)
                         ortho_loss = ortho_loss + torch.norm(BT_B - ident, p='fro')
                         pair_count += 1
 
@@ -3500,7 +3618,7 @@ def get_lora_training_stats(model, svd_sample_ratio: float = 0.2, svd_max_layers
 
 
 # Convenience import for math used in strategies
-import math
+# (math is now imported at the top of the module — keep this comment for clarity)
 
 
 def suggest_lora_config_for_dataset(

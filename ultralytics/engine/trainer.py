@@ -700,13 +700,19 @@ class BaseTrainer:
                         loss, self.loss_items = self.model(batch)
                     
                     # ── LoRA Orthogonal Regularization (Strategy 3) ──
-                    # Optimized: compute every N batches instead of every batch
+                    # Optimized: compute every N batches instead of every batch.
+                    # P1 FIX: cast ortho_loss to the main `loss` dtype before
+                    # adding so AMP runs with bf16/fp16 do not crash on the
+                    # `+` between fp32 ortho and the lower-precision detection
+                    # loss tensor.
                     if self.lora_strategy is not None and self.lora_ortho_weight > 0:
                         self.lora_ortho_batch_counter += 1
                         if self.lora_ortho_batch_counter % self.lora_ortho_frequency == 0:
                             ortho_loss = LoraTrainingStrategy.compute_orthogonal_loss(
                                 self.model, weight=self.lora_ortho_weight
                             )
+                            if ortho_loss.dtype != loss.dtype:
+                                ortho_loss = ortho_loss.to(loss.dtype)
                             loss = loss + ortho_loss
                     
                     # ── Few-Shot LoRA: Knowledge Distillation Loss ──
