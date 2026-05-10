@@ -358,6 +358,10 @@ class BaseTrainer:
 
         # MoE Routing Collapse Detector (initialize if model has MoE layers)
         has_moe = any(hasattr(m, 'num_experts') for m in self.model.modules())
+        # Persist the detection result so the train loop can gate MoE-only
+        # logic (warmup schedule, gain schedule, collapse detector) and avoid
+        # printing MoE messages on plain (non-MoE) models.
+        self._has_moe = has_moe
         if has_moe:
             from ultralytics.nn.modules.moe.analysis import RoutingCollapseDetector
             collapse_thr = getattr(self.args, 'moe_collapse_threshold', 0.8)
@@ -576,57 +580,66 @@ class BaseTrainer:
 
             # MoE Strategy: Freeze experts for initial epochs while router learns balanced routing
             # Key fix: only freeze expert WEIGHTS, not shared_expert/routing — and use shorter warmup
-            moe_warmup_epochs = getattr(self.args, 'moe_expert_warmup_epochs', 3)
-            expert_params = [p for n, p in self.model.named_parameters()
-                             if "experts" in n and "routing" not in n and "router" not in n and "shared" not in n]
-            if epoch < moe_warmup_epochs:
-                for p in expert_params:
-                    p.requires_grad = False
-            elif epoch == moe_warmup_epochs:
-                LOGGER.info(f"[MoE] Unfreezing expert weights after {moe_warmup_epochs}-epoch router warmup...")
-                for p in expert_params:
-                    p.requires_grad = True
+            #
+            # P0 FIX: gate the entire MoE warmup / gain-schedule / collapse-detection
+            # block behind `self._has_moe` (set during _setup_train). Previously this
+            # block ran unconditionally — it would still scan named_parameters() for
+            # 'experts' on every iteration on a plain (non-MoE) YOLO model and
+            # unconditionally print '[MoE] Unfreezing expert weights ...' at
+            # epoch == warmup, even though there were no expert weights at all.
+            if getattr(self, "_has_moe", False):
+                moe_warmup_epochs = getattr(self.args, 'moe_expert_warmup_epochs', 3)
+                expert_params = [p for n, p in self.model.named_parameters()
+                                 if "experts" in n and "routing" not in n and "router" not in n and "shared" not in n]
+                if expert_params:
+                    if epoch < moe_warmup_epochs:
+                        for p in expert_params:
+                            p.requires_grad = False
+                    elif epoch == moe_warmup_epochs:
+                        LOGGER.info(f"[MoE] Unfreezing expert weights after {moe_warmup_epochs}-epoch router warmup...")
+                        for p in expert_params:
+                            p.requires_grad = True
 
-            # MoE Gain Schedule (fixed: was cosine 0.3→0.05, too aggressive decay)
-            # New: warmup → plateau → gentle decay. Prevents late-training routing collapse.
-            if hasattr(self.args, 'moe'):
-                initial_moe = getattr(self.args, 'moe', 0.3)
-                progress = epoch / self.epochs
-                if progress < 0.1:
-                    # Phase 1: warmup — ramp from 0.5x to 1x initial gain
-                    moe_gain = initial_moe * (0.5 + 0.5 * (progress / 0.1))
-                elif progress < 0.7:
-                    # Phase 2: plateau — full gain to maintain balanced routing
-                    moe_gain = initial_moe
-                else:
-                    # Phase 3: gentle linear decay to 0.3x — avoid sudden collapse
-                    decay_progress = (progress - 0.7) / 0.3
-                    moe_gain = initial_moe * (1.0 - 0.7 * decay_progress)
-                self.args.moe = moe_gain
-                # Also update model args/hyp if needed (propagate to loss)
-                if hasattr(self.model, 'args') and isinstance(self.model.args, dict):
-                    self.model.args['moe'] = moe_gain
-                elif hasattr(self.model, 'args') and hasattr(self.model.args, 'moe'):
-                    self.model.args.moe = moe_gain
+                # MoE Gain Schedule (fixed: was cosine 0.3→0.05, too aggressive decay)
+                # New: warmup → plateau → gentle decay. Prevents late-training routing collapse.
+                if hasattr(self.args, 'moe'):
+                    initial_moe = getattr(self.args, 'moe', 0.3)
+                    progress = epoch / self.epochs
+                    if progress < 0.1:
+                        # Phase 1: warmup — ramp from 0.5x to 1x initial gain
+                        moe_gain = initial_moe * (0.5 + 0.5 * (progress / 0.1))
+                    elif progress < 0.7:
+                        # Phase 2: plateau — full gain to maintain balanced routing
+                        moe_gain = initial_moe
+                    else:
+                        # Phase 3: gentle linear decay to 0.3x — avoid sudden collapse
+                        decay_progress = (progress - 0.7) / 0.3
+                        moe_gain = initial_moe * (1.0 - 0.7 * decay_progress)
+                    self.args.moe = moe_gain
+                    # Also update model args/hyp if needed (propagate to loss)
+                    if hasattr(self.model, 'args') and isinstance(self.model.args, dict):
+                        self.model.args['moe'] = moe_gain
+                    elif hasattr(self.model, 'args') and hasattr(self.model.args, 'moe'):
+                        self.model.args.moe = moe_gain
 
-            # MoE Routing Collapse Detection (every 5 epochs after warmup)
-            if epoch > 0 and epoch % 5 == 0 and hasattr(self, '_moe_collapse_detector'):
-                diag = self._moe_collapse_detector.diagnose(self.model)
-                collapsed_layers = [n for n, d in diag.items() if d['collapsed']]
-                if collapsed_layers:
-                    collapse_thr = getattr(self.args, 'moe_collapse_threshold', 0.8)
-                    LOGGER.warning(
-                        f"[MoE] ⚠️ Routing collapse detected at epoch {epoch}: "
-                        f"layers {collapsed_layers} have max_usage > {collapse_thr}. "
-                        f"Auto-increasing noise_std for recovery..."
-                    )
-                    applied = self._moe_collapse_detector.apply_recovery(self.model, diag)
-                    if applied > 0:
-                        LOGGER.info(f"[MoE] Applied {applied} recovery actions.")
-                    # Also boost balance_loss if not already high
-                    if hasattr(self.args, 'moe_balance_loss'):
-                        old_bl = self.args.moe_balance_loss
-                        self.args.moe_balance_loss = min(old_bl * 2.0, 0.5)
+                # MoE Routing Collapse Detection (every 5 epochs after warmup)
+                if epoch > 0 and epoch % 5 == 0 and hasattr(self, '_moe_collapse_detector'):
+                    diag = self._moe_collapse_detector.diagnose(self.model)
+                    collapsed_layers = [n for n, d in diag.items() if d['collapsed']]
+                    if collapsed_layers:
+                        collapse_thr = getattr(self.args, 'moe_collapse_threshold', 0.8)
+                        LOGGER.warning(
+                            f"[MoE] ⚠️ Routing collapse detected at epoch {epoch}: "
+                            f"layers {collapsed_layers} have max_usage > {collapse_thr}. "
+                            f"Auto-increasing noise_std for recovery..."
+                        )
+                        applied = self._moe_collapse_detector.apply_recovery(self.model, diag)
+                        if applied > 0:
+                            LOGGER.info(f"[MoE] Applied {applied} recovery actions.")
+                        # Also boost balance_loss if not already high
+                        if hasattr(self.args, 'moe_balance_loss'):
+                            old_bl = self.args.moe_balance_loss
+                            self.args.moe_balance_loss = min(old_bl * 2.0, 0.5)
                         LOGGER.info(f"[MoE] balance_loss boosted: {old_bl:.4f} → {self.args.moe_balance_loss:.4f}")
 
             # ── LoRA Training Strategies (per-epoch) ──
