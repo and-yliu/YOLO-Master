@@ -57,9 +57,10 @@ python yolo-master-agent/scripts/validate_yolo_master_skill.py --suite contract 
 4. On Apple Silicon, let the dispatcher pick `mps` by default for train/val/eval unless the request already sets `device`.
 5. Let the dispatcher auto-complete safe runtime defaults such as `workers=0` on macOS train/val paths when the request leaves them unset.
 6. Use `yolo` CLI for supported tasks; fall back to Python API only when the CLI does not cover the action.
-7. Pass all task-specific options through `params` unchanged.
-8. Return structured artifacts, metrics, evaluation summaries, environment reports, and next actions.
-9. For long jobs, use `async`/launcher behavior and write a manifest.
+7. For `predict` and `track`, accept `source` in either `inputs.source` or `params.source`; the dispatcher will normalize it before CLI emission.
+8. Pass all task-specific options through `params` unchanged.
+9. Return structured artifacts, metrics, evaluation summaries, environment reports, and next actions.
+10. For long jobs, use `async`/launcher behavior and write a manifest.
 
 ## AutoTrain Loop
 

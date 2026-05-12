@@ -390,6 +390,8 @@ result = model.train(**params)
 - 不需要在 Skill 层手工复制完整参数表
 - 让新参数自动继承到 Skill
 
+对于 `predict` 和 `track`, 调用方可以把 `source` 放在 `inputs.source` 或 `params.source`; dispatcher 会在生成 CLI 命令前统一归一化, 让 agent 自主组装请求时更有容错性。
+
 ### 6.6 Device Selection Rule
 
 为了让代理在 Apple Silicon 上稳定使用本机加速, 建议固定以下设备优先级:

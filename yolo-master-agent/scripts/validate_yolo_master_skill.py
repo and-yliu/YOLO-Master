@@ -89,6 +89,16 @@ def build_result(
         ok = actual == expected
         result["checks"].append({"kind": "equals", "ok": ok, "path": path, "expected": expected, "actual": actual})
         result["passed"] &= ok
+    for path, expected in expect.get("contains", {}).items():
+        actual = dotted_get(payload, path)
+        if isinstance(actual, str):
+            ok = str(expected) in actual
+        elif isinstance(actual, (list, tuple, set)):
+            ok = any(str(expected) in str(item) for item in actual)
+        else:
+            ok = False
+        result["checks"].append({"kind": "contains", "ok": ok, "path": path, "expected": expected, "actual": actual})
+        result["passed"] &= ok
     for path in expect.get("path_exists", []):
         value = dotted_get(payload, path)
         ok = bool(value) and Path(str(value)).exists()

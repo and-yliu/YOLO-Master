@@ -243,6 +243,36 @@
     }
   },
   {
+    "name": "predict_source_param_dry_run",
+    "suite": "dry-run",
+    "request": {
+      "skill": "yolo.predict",
+      "inputs": {
+        "model": "ultralytics/cfg/models/master/v0_1/det/yolo-master-n.yaml"
+      },
+      "params": {
+        "source": "ultralytics/assets/bus.jpg",
+        "imgsz": 32,
+        "max_items": 1
+      },
+      "artifacts": {},
+      "policy": {
+        "dry_run": true
+      }
+    },
+    "expect": {
+      "status": "ok",
+      "paths": ["dry_run", "plan.target", "plan.inputs.source", "auto_completed.device"],
+      "equals": {
+        "environment.references.source.exists": true
+      },
+      "contains": {
+        "plan.params.cmd": "source="
+      },
+      "path_exists": ["manifest"]
+    }
+  },
+  {
     "name": "train_dry_run",
     "suite": "dry-run",
     "request": {
@@ -387,6 +417,35 @@
     "expect": {
       "status": "ok",
       "paths": ["dry_run", "plan.target"],
+      "path_exists": ["manifest"]
+    }
+  },
+  {
+    "name": "lora_train_ia3_dry_run",
+    "suite": "dry-run",
+    "request": {
+      "skill": "yolo.lora.train",
+      "inputs": {
+        "model": "ultralytics/cfg/models/master/v0_1/det/yolo-master-n.yaml",
+        "data": "coco8.yaml"
+      },
+      "params": {
+        "epochs": 1,
+        "imgsz": 32,
+        "batch": 1,
+        "lora_type": "ia3"
+      },
+      "artifacts": {},
+      "policy": {
+        "dry_run": true
+      }
+    },
+    "expect": {
+      "status": "ok",
+      "paths": ["dry_run", "plan.target", "auto_completed.device"],
+      "contains": {
+        "plan.params.cmd": "lora_type=ia3"
+      },
       "path_exists": ["manifest"]
     }
   },

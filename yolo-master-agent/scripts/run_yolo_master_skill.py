@@ -91,12 +91,12 @@ def get_moe_helpers() -> dict[str, Any]:
 
 def get_ultralytics_module_info() -> dict[str, Any]:
     def _loader():
-        ultralytics = importlib.import_module("ultralytics")
-        module_path = Path(ultralytics.__file__).resolve()
+        spec = importlib.util.find_spec("ultralytics")
+        module_path = Path(spec.origin).resolve() if spec and spec.origin else ULTRALYTICS_INIT.resolve()
         return {
             "path": str(module_path),
-            "version": ultralytics.__version__,
-            "local_repo_active": REPO_ROOT in module_path.parents,
+            "version": read_repo_version(),
+            "local_repo_active": REPO_ROOT in module_path.parents or module_path == ULTRALYTICS_INIT.resolve(),
         }
 
     return cached("ultralytics_module_info", _loader)
@@ -1462,11 +1462,12 @@ def run_predict_like(request: dict[str, Any], mode: str) -> dict[str, Any]:
     params, chosen_device, auto_completed = apply_runtime_defaults(request, params, purpose=mode)
     effective_request = deepcopy(request)
     effective_request["params"] = params
+    effective_request["inputs"]["source"] = source
     if is_dry_run(request):
         if prefer_cli(request):
             values = build_cli_key_values(effective_request, skip_inputs={"task"}, skip_params={"max_items"}, inject_save_dir=True)
             return cli_plan(
-                request,
+                effective_request,
                 cli_args_from_values(mode, values),
                 extra={
                     "environment": collect_environment_report(effective_request, selected_device=chosen_device),
@@ -1476,7 +1477,7 @@ def run_predict_like(request: dict[str, Any], mode: str) -> dict[str, Any]:
         target = "YOLO(...).predict" if mode == "predict" else "YOLO(...).track"
         plan_params = {"source": source, **params}
         return plan_response(
-            request,
+            effective_request,
             f"{mode} dry run prepared",
             "python_api",
             target,
