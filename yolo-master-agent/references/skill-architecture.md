@@ -448,6 +448,8 @@ result = model.train(**params)
 | `yolo.train` | 训练与恢复训练 | `Model.train()` | Yes | `yolo train ...` |
 | `yolo.val` | 验证与 COCO JSON 评估 | `Model.val()` / validator | No | `yolo val ...` |
 | `yolo.predict` | 单图/批量/目录/URL/流推理 | `Model.predict()` | Optional | `yolo predict ...` |
+| `yolo.multimodal.infer` | YOLO 检测证据 + OpenAI VLM/LLM 协同推理 | `Model.predict()` + Responses API | No | Python orchestrator |
+| `yolo.multimodal.evaluate` | 数据集/图片目录抽样的 YOLO + VLM/LLM 批量复核与报告 | `Model.predict()` + OpenAI-compatible API | No | Python orchestrator |
 | `yolo.track` | 视频/流追踪 | `Model.track()` | Optional | `yolo track ...` |
 | `yolo.export` | 导出各格式模型 | `Model.export()` | No | `yolo export ...` |
 | `yolo.benchmark` | 导出格式对比与性能基准 | `Model.benchmark()` | Optional | `yolo benchmark ...` |
@@ -711,6 +713,146 @@ result = model.train(**params)
     "save": true,
     "save_txt": true,
     "visualize": false
+  }
+}
+```
+
+### 8.5.1 `yolo.multimodal.infer`
+
+**Intent**
+
+在常规 YOLO 检测之后, 引入 OpenAI VLM/LLM 协同推理, 用于复杂图像理解、检测结果复核、漏检/误检分析和面向评估报告的解释生成。它是 `yolo.predict` 的增强层, 不是替代层。
+
+**Required Inputs**
+
+- `model`
+- `source`
+
+**Optional Inputs / Params**
+
+- `prompt` 或 `question`: 用户的视觉推理任务
+- `thinking_with_image`: 默认 `true`, 是否向 VLM 附带图像
+- `structured_output`: 默认 `true`, 要求模型返回可解析 JSON verdict
+- `openai_api_mode`: 默认 `auto`, 可选 `responses` 或 `chat.completions`
+- `vlm_model`: 默认 `OPENAI_VLM_MODEL` / `OPENAI_MODEL` / `gpt-4.1-mini`
+- `llm_model`: 默认 `OPENAI_LLM_MODEL` / `OPENAI_MODEL`, 用于二次精炼
+- `enable_llm_refine`: 强制启用二次 LLM 精炼
+- `max_reasoning_items`: 进入推理上下文的结果数量
+- `max_reasoning_boxes`: 每张图进入推理上下文的检测框数量
+- `skip_yolo`: 测试或复用既有检测证据时跳过 YOLO
+- `detections`: 配合 `skip_yolo=true` 使用的检测摘要
+
+**Environment**
+
+- `OPENAI_API_KEY`
+- `OPENAI_BASE_URL` optional
+- `OPENAI_API_MODE` optional
+- `OPENAI_VLM_MODEL` optional
+- `OPENAI_LLM_MODEL` optional
+
+**Execution Logic**
+
+1. 规范化 `source`、模型路径和 YOLO 参数。
+2. 默认先执行 `YOLO(...).predict(...)`, 并把 boxes 压缩成 `label/confidence/xyxy` 推理证据。
+3. 构造 `thinking-with-image` prompt, 要求模型私下对比图像与检测摘要, 只输出答案、证据、不确定性和下一步动作, 不暴露隐藏推理链。
+4. 若 `OPENAI_API_KEY` 缺失, 返回 `blocked`, 同时保留 YOLO 检测证据。
+5. 若 VLM 成功且启用了 `llm_model` 或 `enable_llm_refine`, 再调用一次 LLM 做一致性精炼。
+6. 当 `structured_output=true` 时, 尝试解析 `answer / visual_evidence / yolo_cross_check / uncertainty / recommended_next_actions` 为 `multimodal.*.verdict`。
+7. 返回 `results`, `multimodal.vlm`, `multimodal.llm_refine`, `environment`, `artifacts`, `manifest`。
+
+DashScope 等 OpenAI-compatible chat endpoints 可设置:
+
+```json
+{
+  "params": {
+    "openai_base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "openai_api_mode": "chat.completions",
+    "vlm_model": "qwen-vl-plus",
+    "llm_model": "qwen-plus"
+  }
+}
+```
+
+**Status Semantics**
+
+- `ok`: YOLO 与 VLM 路径完成, 可选 LLM refine 未失败
+- `blocked`: YOLO 可完成, 但 OpenAI 凭证或图像输入阻断了多模态推理
+- `partial`: YOLO 完成, 但 VLM 或 refine 调用失败
+
+**Example**
+
+```json
+{
+  "skill": "yolo.multimodal.infer",
+  "inputs": {
+    "model": "yolo11n.pt",
+    "source": "ultralytics/assets/bus.jpg",
+    "prompt": "What matters most in this image?"
+  },
+  "params": {
+    "thinking_with_image": true,
+    "vlm_model": "gpt-4.1-mini",
+    "llm_model": "gpt-4.1-mini",
+    "max_reasoning_items": 3,
+    "max_reasoning_boxes": 20
+  }
+}
+```
+
+### 8.5.2 `yolo.multimodal.evaluate`
+
+**Intent**
+
+把 `yolo.multimodal.infer` 从单图能力扩展为可重复的批量评估入口。它优先解析 `inputs.data` 的 dataset YAML 或 `inputs.source` 的本地图像集合, 对样本逐张执行 YOLO 检测、VLM 复核、可选 LLM 精炼, 最后生成结构化聚合报告。
+
+**Required Inputs**
+
+- `model`
+- `data` 或 `source`
+
+**Optional Inputs / Params**
+
+- `split`: dataset split, 默认 `val`
+- `limit`: 样本上限, 默认 `5`, `0` 表示全部解析图片
+- `offset` / `stride` / `shuffle` / `seed`: 控制抽样
+- `run_yolo_val`: 若有 `inputs.data`, 同步跑一次 YOLO-only baseline
+- `include_ground_truth_in_prompt`: 默认 `false`; true 时才把标签摘要放进 VLM prompt
+- 所有 `yolo.multimodal.infer` 的 OpenAI/VLM/LLM 参数
+- 常规 YOLO predict 参数, 如 `imgsz`, `conf`, `device`
+
+**Execution Logic**
+
+1. 解析 dataset YAML 或本地 `source`, 生成确定性图片样本列表。
+2. 对每张图片执行 `YOLO(model).predict(...)`, 默认使用自适应设备选择, Apple Silicon 优先 `mps`。
+3. 将检测框压缩为 `label/confidence/xyxy` 证据, 并读取可用 YOLO 标签作为 post-hoc report ground truth。
+4. 调用 OpenAI-compatible VLM; 当 `llm_model` 或 `enable_llm_refine=true` 时再执行二次 LLM 精炼。
+5. 解析每张图的 structured JSON verdict, 聚合 `ok/blocked/partial/failed`, parse rate, 检测框数量、标签计数和 `false_positives/possible_misses/duplicate_or_fragmented` 标记。
+6. 写入 `multimodal-evaluation.json` artifact 与 `skill_manifest.json`, 返回 `evaluation`, `results`, `multimodal.dataset`, `baseline`。
+
+**Example**
+
+```json
+{
+  "skill": "yolo.multimodal.evaluate",
+  "runtime": {
+    "prefer_cli": true,
+    "prefer_mps": true
+  },
+  "inputs": {
+    "model": "yolo11n.pt",
+    "data": "coco128.yaml",
+    "prompt": "Cross-check detector outputs and summarize obvious false positives, misses, duplicates, and uncertainty."
+  },
+  "params": {
+    "limit": 5,
+    "split": "val",
+    "imgsz": 640,
+    "batch": 1,
+    "thinking_with_image": true,
+    "vlm_model": "qwen-vl-plus",
+    "llm_model": "qwen-plus",
+    "openai_base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "openai_api_mode": "chat.completions"
   }
 }
 ```
@@ -1150,6 +1292,7 @@ result = model.train(**params)
 - `fast-smoke`: 安装与 dry-run 规划路径
 - `cli-smoke`: 真实 `yolo` CLI 轻量命令
 - `deep-smoke`: 模型 inspect 与本地 `.pt` 预测
+- `contract`: 失败路径、恢复路径、manifest, 以及 `yolo.multimodal.infer` / `yolo.multimodal.evaluate` 的 OpenAI blocked/stub 路径
 - `all`: 所有非 `manual_only` 用例, 会包含较慢的 `cli-smoke` 和 `deep-smoke`
 - `extended-cli`: 真实 mini-dataset `yolo val`, 默认标记为 `manual_only`
 - manual train soak: 只保留为人工探针, 不纳入默认 AutoTrain
@@ -1170,6 +1313,7 @@ Validator 子进程会设置 `YOLO_MASTER_AGENT_RUNTIME_CACHE=1`, 让 Torch/MPS 
   "save_dir": "/abs/path",
   "artifacts": [],
   "metrics": {},
+  "multimodal": {},
   "created_at": "2026-05-12T00:00:00"
 }
 ```
@@ -1269,6 +1413,8 @@ Validator 子进程会设置 `YOLO_MASTER_AGENT_RUNTIME_CACHE=1`, 让 Torch/MPS 
 3. `yolo.moe.diagnose`
 4. `yolo.moe.prune`
 5. `yolo.solutions.run`
+6. `yolo.multimodal.infer`
+7. `yolo.multimodal.evaluate`
 
 ### Phase 3: Launcher and Workflow Skills
 

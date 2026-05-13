@@ -1,6 +1,6 @@
 interface:
   display_name: "YOLO-Master Agent"
-  short_description: "Run YOLO-Master with yolo CLI"
-  default_prompt: "Use $yolo-master-agent to install Ultralytics, inspect the environment, and run YOLO train, val, predict, export, and recovery workflows with the `yolo` CLI first."
+  short_description: "Run YOLO-Master with yolo CLI and multimodal evaluation"
+  default_prompt: "Use $yolo-master-agent to install Ultralytics, inspect the environment, and run YOLO train, val, predict, export, multimodal inference/evaluation, and recovery workflows with the `yolo` CLI first."
 policy:
   allow_implicit_invocation: true

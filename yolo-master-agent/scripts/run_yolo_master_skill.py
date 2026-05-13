@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
 import contextlib
 import importlib
 import io
 import json
+import mimetypes
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -15,6 +18,8 @@ import sys
 import sysconfig
 import time
 import traceback
+import urllib.error
+import urllib.request
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -32,6 +37,47 @@ DATASET_CFG_DIR = REPO_ROOT / "ultralytics" / "cfg" / "datasets"
 ANSI_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
 RUNTIME_CACHE_FILE = LOG_DIR / "runtime-cache.json"
 RUNTIME_CACHE_TTL_SEC = 600
+IMAGE_EXTENSIONS = {".bmp", ".dng", ".jpeg", ".jpg", ".mpo", ".png", ".tif", ".tiff", ".webp"}
+MULTIMODAL_PARAM_KEYS = {
+    "prompt",
+    "question",
+    "system_prompt",
+    "developer_prompt",
+    "thinking_with_image",
+    "method",
+    "provider",
+    "vlm_provider",
+    "vlm_model",
+    "llm_model",
+    "openai_base_url",
+    "openai_api_mode",
+    "image_detail",
+    "max_output_tokens",
+    "temperature",
+    "max_reasoning_items",
+    "max_reasoning_boxes",
+    "max_image_bytes",
+    "structured_output",
+    "enable_llm_refine",
+    "skip_yolo",
+    "detections",
+}
+MULTIMODAL_EVALUATE_PARAM_KEYS = {
+    "data",
+    "split",
+    "limit",
+    "max_images",
+    "offset",
+    "stride",
+    "shuffle",
+    "seed",
+    "prompt_template",
+    "include_ground_truth",
+    "include_ground_truth_in_prompt",
+    "run_yolo_val",
+    "continue_on_error",
+    "report_name",
+}
 
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -208,6 +254,22 @@ def json_safe(value: Any) -> Any:
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
     return str(value)
+
+
+def parse_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"1", "true", "yes", "on"}:
+            return True
+        if text in {"0", "false", "no", "off"}:
+            return False
+    return bool(value)
 
 
 def read_repo_version() -> str:
@@ -983,6 +1045,7 @@ def write_manifest(request: dict[str, Any], payload: dict[str, Any]) -> Path:
         "auto_completed": payload.get("auto_completed", {}),
         "attempts": payload.get("attempts", []),
         "recovery": payload.get("recovery", {}),
+        "multimodal": payload.get("multimodal", {}),
         "recommendations": payload.get("recommendations", []),
         "job": payload.get("job", {}),
         "dry_run": payload.get("dry_run", False),
@@ -1053,6 +1116,462 @@ def summarize_results(results: Any, max_items: int = 10) -> list[dict[str, Any]]
             }
         summary.append(item)
     return summary
+
+
+def summarize_results_for_reasoning(results: Any, max_items: int = 5, max_boxes: int = 20) -> list[dict[str, Any]]:
+    """Return compact, structured prediction evidence for multimodal reasoning."""
+    summary = []
+    for result in list(results)[:max_items]:
+        item: dict[str, Any] = {
+            "path": str(getattr(result, "path", "")),
+            "speed": json_safe(getattr(result, "speed", {})),
+            "detections": [],
+        }
+        names = getattr(result, "names", {}) or {}
+        boxes = getattr(result, "boxes", None)
+        if boxes is not None:
+            try:
+                xyxy = boxes.xyxy.detach().cpu().tolist()
+                cls = boxes.cls.detach().cpu().tolist()
+                conf = boxes.conf.detach().cpu().tolist()
+                for idx, coords in enumerate(xyxy[:max_boxes]):
+                    class_id = int(cls[idx]) if idx < len(cls) else None
+                    item["detections"].append(
+                        {
+                            "class_id": class_id,
+                            "label": names.get(class_id, str(class_id)) if class_id is not None else None,
+                            "confidence": round(float(conf[idx]), 4) if idx < len(conf) else None,
+                            "xyxy": [round(float(v), 2) for v in coords],
+                        }
+                    )
+            except Exception:
+                try:
+                    item["boxes"] = len(boxes)
+                except Exception:
+                    item["boxes"] = 0
+        summary.append(item)
+    return summary
+
+
+def image_source_for_openai(source: Any, results_summary: list[dict[str, Any]]) -> str | None:
+    candidates: list[str] = []
+    if source is not None:
+        candidates.append(str(source))
+    if results_summary and results_summary[0].get("path"):
+        candidate = str(results_summary[0]["path"])
+        if candidate not in candidates:
+            candidates.append(candidate)
+    for candidate in candidates:
+        if candidate.startswith(("http://", "https://", "data:image/")):
+            return candidate
+        path = resolved_path(candidate)
+        if path.exists() and path.is_file():
+            return str(path)
+    return None
+
+
+def encode_image_reference_for_openai(image_ref: str, max_bytes: int = 20_000_000) -> dict[str, Any]:
+    if image_ref.startswith(("http://", "https://", "data:image/")):
+        return {"image_url": image_ref, "kind": "url" if image_ref.startswith(("http://", "https://")) else "data_url"}
+    path = resolved_path(image_ref)
+    if not path.exists() or not path.is_file():
+        raise FileNotFoundError(f"Image source for VLM is not a file or URL: {image_ref}")
+    size = path.stat().st_size
+    if size > max_bytes:
+        raise ValueError(f"Image source is too large for inline VLM upload: {path} ({size} bytes)")
+    mime_type = mimetypes.guess_type(path.name)[0] or "image/jpeg"
+    data = base64.b64encode(path.read_bytes()).decode("ascii")
+    return {"image_url": f"data:{mime_type};base64,{data}", "kind": "local_file", "path": str(path.resolve())}
+
+
+def openai_config(params: dict[str, Any]) -> dict[str, Any]:
+    provider = params.get("vlm_provider") or params.get("provider") or "openai"
+    base_url = str(params.get("openai_base_url") or os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1").rstrip("/")
+    return {
+        "provider": provider,
+        "api_key_env": "OPENAI_API_KEY",
+        "api_key_present": bool(os.environ.get("OPENAI_API_KEY")),
+        "base_url": base_url,
+        "api_mode": params.get("openai_api_mode") or os.environ.get("OPENAI_API_MODE") or "auto",
+        "vlm_model": params.get("vlm_model") or os.environ.get("OPENAI_VLM_MODEL") or os.environ.get("OPENAI_MODEL") or "gpt-4.1-mini",
+        "llm_model": params.get("llm_model") or os.environ.get("OPENAI_LLM_MODEL") or os.environ.get("OPENAI_MODEL"),
+    }
+
+
+def build_thinking_with_image_prompt(
+    user_prompt: str,
+    detections: list[dict[str, Any]],
+    *,
+    method: str = "thinking-with-image",
+    thinking_with_image: bool = True,
+    structured_output: bool = True,
+) -> str:
+    detection_text = json.dumps(json_safe(detections), ensure_ascii=False, indent=2)
+    image_instruction = (
+        "Privately inspect the image, compare it with the YOLO detection summary, and resolve disagreements."
+        if thinking_with_image
+        else "Use the user prompt and YOLO detection summary as the evidence surface, and do not assume image access."
+    )
+    output_instruction = (
+        "Return exactly one JSON object without Markdown fences. Use these keys: answer, visual_evidence, "
+        "yolo_cross_check, uncertainty, recommended_next_actions. In yolo_cross_check, include arrays named "
+        "confirmed, false_positives, possible_misses, duplicate_or_fragmented, and notes when applicable."
+        if structured_output
+        else "Return these sections: answer, visual_evidence, yolo_cross_check, uncertainty, recommended_next_actions."
+    )
+    return (
+        "You are helping a YOLO-Master agent perform multimodal visual inference.\n"
+        f"Method: {method}. {image_instruction} Do not reveal hidden chain-of-thought. "
+        "Return a concise, evidence-based answer.\n\n"
+        f"User task:\n{user_prompt}\n\n"
+        f"YOLO detection summary:\n{detection_text}\n\n{output_instruction}"
+    )
+
+
+def extract_json_object(text: str) -> dict[str, Any] | None:
+    if not text:
+        return None
+    cleaned = text.strip()
+    fence_match = re.search(r"```(?:json)?\s*(.*?)\s*```", cleaned, re.DOTALL | re.IGNORECASE)
+    if fence_match:
+        cleaned = fence_match.group(1).strip()
+
+    def balanced_fragment(source: str) -> str | None:
+        start = None
+        depth = 0
+        in_string = False
+        escape = False
+        opener = None
+        for idx, ch in enumerate(source):
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+                continue
+            if ch == '"':
+                in_string = True
+            elif ch in "{[":
+                if start is None:
+                    start = idx
+                    opener = ch
+                    depth = 1
+                    continue
+                depth += 1
+            elif ch in '}]':
+                if start is None:
+                    continue
+                depth -= 1
+                if depth == 0 and opener is not None:
+                    return source[start : idx + 1]
+        return None
+
+    fragment = balanced_fragment(cleaned)
+    if fragment is not None:
+        try:
+            value = json.loads(fragment)
+            return value if isinstance(value, dict) else None
+        except Exception:
+            pass
+
+    try:
+        value = json.loads(cleaned)
+        return value if isinstance(value, dict) else None
+    except Exception:
+        pass
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"[{]", cleaned):
+        try:
+            value, _ = decoder.raw_decode(cleaned[match.start() :])
+        except Exception:
+            continue
+        if isinstance(value, dict):
+            return value
+    return None
+
+
+def attach_multimodal_verdict(result: dict[str, Any]) -> dict[str, Any]:
+    result = dict(result)
+    if result.get("status") == "ok" and "verdict" not in result:
+        verdict = extract_json_object(str(result.get("text") or ""))
+        expected_keys = {"answer", "visual_evidence", "yolo_cross_check", "uncertainty", "recommended_next_actions"}
+        if verdict is not None and expected_keys.intersection(verdict):
+            result["verdict"] = json_safe(verdict)
+            result["verdict_parse_status"] = "parsed"
+        else:
+            result["verdict_parse_status"] = "unparsed"
+    return result
+
+
+def extract_openai_text(payload: dict[str, Any]) -> str:
+    if isinstance(payload.get("output_text"), str):
+        return payload["output_text"]
+    chunks: list[str] = []
+    for output in payload.get("output", []) or []:
+        for content in output.get("content", []) or []:
+            text = content.get("text")
+            if isinstance(text, str):
+                chunks.append(text)
+    return "\n".join(chunks).strip()
+
+
+def extract_openai_chat_text(payload: dict[str, Any]) -> str:
+    chunks: list[str] = []
+    for choice in payload.get("choices", []) or []:
+        message = choice.get("message") or {}
+        content = message.get("content")
+        if isinstance(content, str):
+            chunks.append(content)
+        elif isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict) and isinstance(item.get("text"), str):
+                    chunks.append(item["text"])
+    return "\n".join(chunks).strip()
+
+
+def classify_openai_http_status(detail: str) -> str:
+    text = detail.lower()
+    blocked_markers = (
+        "access denied",
+        "arrearage",
+        "insufficient_quota",
+        "quota",
+        "billing",
+        "permission",
+        "unauthorized",
+        "forbidden",
+    )
+    return "blocked" if any(marker in text for marker in blocked_markers) else "failed"
+
+
+def call_openai_responses(
+    *,
+    model: str,
+    user_text: str,
+    developer_text: str | None = None,
+    image_url: str | None = None,
+    image_detail: str = "auto",
+    base_url: str | None = None,
+    max_output_tokens: int = 800,
+    temperature: float | None = None,
+) -> dict[str, Any]:
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        return {
+            "status": "blocked",
+            "provider": "openai",
+            "summary": "OPENAI_API_KEY is not set; multimodal reasoning was skipped.",
+            "api_key_env": "OPENAI_API_KEY",
+        }
+
+    base_url = (base_url or os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1").rstrip("/")
+    content: list[dict[str, Any]] = [{"type": "input_text", "text": user_text}]
+    if image_url:
+        content.append({"type": "input_image", "image_url": image_url, "detail": image_detail})
+    input_items = []
+    if developer_text:
+        input_items.append({"role": "developer", "content": [{"type": "input_text", "text": developer_text}]})
+    input_items.append({"role": "user", "content": content})
+
+    body: dict[str, Any] = {
+        "model": model,
+        "input": input_items,
+        "max_output_tokens": max_output_tokens,
+    }
+    if temperature is not None:
+        body["temperature"] = temperature
+
+    request = urllib.request.Request(
+        f"{base_url}/responses",
+        data=json.dumps(body).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=120) as response_handle:
+            payload = json.loads(response_handle.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        status = classify_openai_http_status(detail)
+        return {
+            "status": status,
+            "provider": "openai",
+            "summary": f"OpenAI Responses API returned HTTP {exc.code}",
+            "error": {"type": "HTTPError", "code": exc.code, "body": detail},
+        }
+    except Exception as exc:
+        return {
+            "status": "failed",
+            "provider": "openai",
+            "summary": "OpenAI Responses API request failed",
+            "error": {"type": type(exc).__name__, "message": str(exc)},
+        }
+
+    return {
+        "status": "ok",
+        "provider": "openai",
+        "api_mode": "responses",
+        "model": model,
+        "text": extract_openai_text(payload),
+        "response_id": payload.get("id"),
+        "usage": json_safe(payload.get("usage", {})),
+    }
+
+
+def call_openai_chat_completions(
+    *,
+    model: str,
+    user_text: str,
+    developer_text: str | None = None,
+    image_url: str | None = None,
+    base_url: str | None = None,
+    max_output_tokens: int = 800,
+    temperature: float | None = None,
+) -> dict[str, Any]:
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        return {
+            "status": "blocked",
+            "provider": "openai",
+            "api_mode": "chat.completions",
+            "summary": "OPENAI_API_KEY is not set; multimodal reasoning was skipped.",
+            "api_key_env": "OPENAI_API_KEY",
+        }
+
+    base_url = (base_url or os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1").rstrip("/")
+    content: list[dict[str, Any]] = [{"type": "text", "text": user_text}]
+    if image_url:
+        content.append({"type": "image_url", "image_url": {"url": image_url}})
+    messages = []
+    if developer_text:
+        messages.append({"role": "system", "content": developer_text})
+    messages.append({"role": "user", "content": content})
+
+    body: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": max_output_tokens,
+    }
+    if temperature is not None:
+        body["temperature"] = temperature
+
+    request = urllib.request.Request(
+        f"{base_url}/chat/completions",
+        data=json.dumps(body).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=120) as response_handle:
+            payload = json.loads(response_handle.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        status = classify_openai_http_status(detail)
+        return {
+            "status": status,
+            "provider": "openai",
+            "api_mode": "chat.completions",
+            "summary": f"OpenAI-compatible Chat Completions API returned HTTP {exc.code}",
+            "error": {"type": "HTTPError", "code": exc.code, "body": detail},
+        }
+    except Exception as exc:
+        return {
+            "status": "failed",
+            "provider": "openai",
+            "api_mode": "chat.completions",
+            "summary": "OpenAI-compatible Chat Completions API request failed",
+            "error": {"type": type(exc).__name__, "message": str(exc)},
+        }
+
+    return {
+        "status": "ok",
+        "provider": "openai",
+        "api_mode": "chat.completions",
+        "model": model,
+        "text": extract_openai_chat_text(payload),
+        "response_id": payload.get("id"),
+        "usage": json_safe(payload.get("usage", {})),
+    }
+
+
+def call_openai_compatible(
+    *,
+    model: str,
+    user_text: str,
+    developer_text: str | None = None,
+    image_url: str | None = None,
+    image_detail: str = "auto",
+    base_url: str | None = None,
+    api_mode: str = "auto",
+    max_output_tokens: int = 800,
+    temperature: float | None = None,
+) -> dict[str, Any]:
+    normalized_mode = api_mode.replace("_", ".").lower()
+    if normalized_mode in {"chat", "chat.completion", "chat.completions"}:
+        return call_openai_chat_completions(
+            model=model,
+            user_text=user_text,
+            developer_text=developer_text,
+            image_url=image_url,
+            base_url=base_url,
+            max_output_tokens=max_output_tokens,
+            temperature=temperature,
+        )
+    if normalized_mode == "responses":
+        return call_openai_responses(
+            model=model,
+            user_text=user_text,
+            developer_text=developer_text,
+            image_url=image_url,
+            image_detail=image_detail,
+            base_url=base_url,
+            max_output_tokens=max_output_tokens,
+            temperature=temperature,
+        )
+
+    responses_result = call_openai_responses(
+        model=model,
+        user_text=user_text,
+        developer_text=developer_text,
+        image_url=image_url,
+        image_detail=image_detail,
+        base_url=base_url,
+        max_output_tokens=max_output_tokens,
+        temperature=temperature,
+    )
+    if responses_result.get("status") in {"ok", "blocked"}:
+        return responses_result
+    chat_result = call_openai_chat_completions(
+        model=model,
+        user_text=user_text,
+        developer_text=developer_text,
+        image_url=image_url,
+        base_url=base_url,
+        max_output_tokens=max_output_tokens,
+        temperature=temperature,
+    )
+    if chat_result.get("status") == "ok":
+        chat_result["fallback_from"] = responses_result
+    return chat_result
+
+
+def multimodal_overall_status(vlm_result: dict[str, Any], llm_result: dict[str, Any] | None) -> str:
+    vlm_status = vlm_result.get("status")
+    if vlm_status == "blocked" or (llm_result and llm_result.get("status") == "blocked"):
+        return "blocked"
+    if vlm_status != "ok":
+        return "partial"
+    if llm_result and llm_result.get("status") == "failed":
+        return "partial"
+    return "ok"
 
 
 def response(skill: str, status: str, summary: str, **kwargs: Any) -> dict[str, Any]:
@@ -1596,6 +2115,942 @@ def run_predict_like(request: dict[str, Any], mode: str) -> dict[str, Any]:
     return payload
 
 
+def split_yolo_and_multimodal_params(params: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    yolo_params = {}
+    multimodal_params = {}
+    for key, value in params.items():
+        if key in MULTIMODAL_PARAM_KEYS:
+            multimodal_params[key] = value
+        else:
+            yolo_params[key] = value
+    return yolo_params, multimodal_params
+
+
+def split_yolo_multimodal_evaluate_params(params: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    yolo_params: dict[str, Any] = {}
+    multimodal_params: dict[str, Any] = {}
+    evaluate_params: dict[str, Any] = {}
+    for key, value in params.items():
+        if key in MULTIMODAL_PARAM_KEYS:
+            multimodal_params[key] = value
+        elif key in MULTIMODAL_EVALUATE_PARAM_KEYS:
+            evaluate_params[key] = value
+        else:
+            yolo_params[key] = value
+    return yolo_params, multimodal_params, evaluate_params
+
+
+def is_image_file(path: Path) -> bool:
+    return path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+
+
+def read_image_list_file(path: Path, root: Path | None = None) -> list[Path]:
+    images: list[Path] = []
+    base = root or path.parent
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        candidate = Path(line)
+        if not candidate.is_absolute():
+            candidate = (base / candidate).resolve()
+        if is_image_file(candidate):
+            images.append(candidate)
+    return images
+
+
+def expand_image_reference(value: Any, root: Path | None = None) -> list[Path]:
+    if value in (None, ""):
+        return []
+    if isinstance(value, (list, tuple, set)):
+        images: list[Path] = []
+        for item in value:
+            images.extend(expand_image_reference(item, root=root))
+        return images
+    text = str(value)
+    if text.startswith(("http://", "https://", "data:image/")):
+        return []
+    candidate = Path(text)
+    if not candidate.is_absolute():
+        candidate = ((root or REPO_ROOT) / candidate).resolve()
+    if candidate.is_dir():
+        return sorted(path.resolve() for path in candidate.rglob("*") if is_image_file(path))
+    if candidate.is_file():
+        if candidate.suffix.lower() == ".txt":
+            return read_image_list_file(candidate, root=root)
+        if is_image_file(candidate):
+            return [candidate.resolve()]
+    return []
+
+
+def normalize_dataset_names(names: Any) -> dict[int, str]:
+    if isinstance(names, dict):
+        normalized = {}
+        for key, value in names.items():
+            try:
+                normalized[int(key)] = str(value)
+            except Exception:
+                continue
+        return normalized
+    if isinstance(names, list):
+        return {idx: str(value) for idx, value in enumerate(names)}
+    return {}
+
+
+def load_dataset_yaml(data_ref: Any) -> tuple[Path, dict[str, Any]]:
+    import yaml
+
+    if data_ref in (None, ""):
+        raise ValueError("`inputs.data` or `params.data` is required when no image `source` is provided.")
+    normalized = normalize_value(data_ref)
+    data_path = Path(str(normalized))
+    if not data_path.is_absolute():
+        data_path = resolved_path(data_path)
+    if not data_path.exists():
+        raise FileNotFoundError(f"Dataset YAML was not found: {data_ref}")
+    loaded = yaml.safe_load(data_path.read_text(encoding="utf-8")) or {}
+    if not isinstance(loaded, dict):
+        raise ValueError(f"Dataset YAML must contain a mapping: {data_path}")
+    return data_path, loaded
+
+
+def dataset_settings_dir() -> Path | None:
+    try:
+        settings = dict(get_ultralytics_core()["SETTINGS"])
+    except Exception:
+        return None
+    value = settings.get("datasets_dir")
+    return Path(str(value)).expanduser().resolve() if value else None
+
+
+def resolve_dataset_root(data_path: Path, dataset_cfg: dict[str, Any]) -> Path:
+    path_value = dataset_cfg.get("path")
+    if path_value in (None, ""):
+        return data_path.parent.resolve()
+    candidate_path = Path(str(path_value)).expanduser()
+    if candidate_path.is_absolute():
+        return candidate_path.resolve()
+
+    candidates = [
+        (data_path.parent / candidate_path).resolve(),
+        (REPO_ROOT / candidate_path).resolve(),
+    ]
+    settings_dir = dataset_settings_dir()
+    if settings_dir is not None:
+        candidates.append((settings_dir / candidate_path).resolve())
+    candidates.append((REPO_ROOT.parent / "datasets" / candidate_path).resolve())
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
+
+
+def dataset_split_spec(dataset_cfg: dict[str, Any], requested_split: str) -> tuple[str, Any]:
+    for split in (requested_split, "val", "train", "test"):
+        value = dataset_cfg.get(split)
+        if value not in (None, ""):
+            return split, value
+    raise ValueError(f"Dataset YAML has no usable split for `{requested_split}`.")
+
+
+def collect_dataset_images(data_ref: Any, split: str) -> tuple[list[Path], dict[str, Any], dict[int, str]]:
+    data_path, dataset_cfg = load_dataset_yaml(data_ref)
+    root = resolve_dataset_root(data_path, dataset_cfg)
+    actual_split, spec = dataset_split_spec(dataset_cfg, split)
+    images = expand_image_reference(spec, root=root)
+    names = normalize_dataset_names(dataset_cfg.get("names", {}))
+    dataset_info = {
+        "data": str(data_path),
+        "root": str(root),
+        "split": actual_split,
+        "requested_split": split,
+        "source": json_safe(spec),
+        "names_count": len(names),
+    }
+    return images, dataset_info, names
+
+
+def dedupe_images(images: list[Path]) -> list[Path]:
+    seen: set[str] = set()
+    unique: list[Path] = []
+    for image in images:
+        key = str(image.resolve())
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(image.resolve())
+    return unique
+
+
+def select_image_sample(
+    images: list[Path],
+    *,
+    limit: int | None,
+    offset: int = 0,
+    stride: int = 1,
+    shuffle: bool = False,
+    seed: int | None = None,
+) -> list[Path]:
+    selected = list(images)
+    if shuffle:
+        rng = random.Random(seed)
+        rng.shuffle(selected)
+    if offset > 0:
+        selected = selected[offset:]
+    if stride > 1:
+        selected = selected[::stride]
+    if limit is not None and limit > 0:
+        selected = selected[:limit]
+    return selected
+
+
+def collect_multimodal_evaluation_images(
+    request: dict[str, Any],
+    evaluate_params: dict[str, Any],
+    yolo_params: dict[str, Any],
+    multimodal_params: dict[str, Any],
+) -> tuple[list[Path], dict[str, Any], dict[int, str]]:
+    split = str(evaluate_params.get("split", "val"))
+    source_ref = request["inputs"].get("source") or yolo_params.pop("source", None) or multimodal_params.get("source")
+    data_ref = request["inputs"].get("data") or evaluate_params.get("data") or yolo_params.pop("data", None)
+    if source_ref not in (None, ""):
+        images = expand_image_reference(source_ref)
+        dataset_info = {"source": json_safe(source_ref), "split": None, "root": None, "names_count": 0}
+        names: dict[int, str] = {}
+    else:
+        images, dataset_info, names = collect_dataset_images(data_ref, split)
+    images = dedupe_images(images)
+    limit_raw = evaluate_params.get("limit", evaluate_params.get("max_images", 5))
+    limit = int(limit_raw) if limit_raw not in (None, "") else 5
+    limit_value = None if limit <= 0 else limit
+    seed_raw = evaluate_params.get("seed")
+    seed = int(seed_raw) if seed_raw not in (None, "") else None
+    sample = select_image_sample(
+        images,
+        limit=limit_value,
+        offset=int(evaluate_params.get("offset", 0)),
+        stride=max(1, int(evaluate_params.get("stride", 1))),
+        shuffle=parse_bool(evaluate_params.get("shuffle"), False),
+        seed=seed,
+    )
+    dataset_info["images_total"] = len(images)
+    dataset_info["sample_count"] = len(sample)
+    dataset_info["sample_limit"] = limit_value
+    dataset_info["sample_offset"] = int(evaluate_params.get("offset", 0))
+    dataset_info["sample_stride"] = max(1, int(evaluate_params.get("stride", 1)))
+    if not sample:
+        raise ValueError("No local images were found for multimodal evaluation.")
+    return sample, dataset_info, names
+
+
+def label_path_for_image(image_path: Path) -> Path:
+    parts = image_path.resolve().parts
+    if "images" in parts:
+        idx = len(parts) - 1 - list(reversed(parts)).index("images")
+        return Path(*parts[:idx], "labels", *parts[idx + 1 :]).with_suffix(".txt")
+    return image_path.with_suffix(".txt")
+
+
+def read_ground_truth_summary(image_path: Path, names: dict[int, str], max_objects: int = 30) -> dict[str, Any]:
+    label_path = label_path_for_image(image_path)
+    summary: dict[str, Any] = {"path": str(label_path), "exists": label_path.exists(), "objects": 0, "labels": [], "label_counts": {}}
+    if not label_path.exists():
+        return summary
+    labels: list[dict[str, Any]] = []
+    counts: dict[str, int] = {}
+    for raw_line in label_path.read_text(encoding="utf-8").splitlines():
+        parts = raw_line.strip().split()
+        if len(parts) < 5:
+            continue
+        try:
+            class_id = int(float(parts[0]))
+            xywhn = [round(float(value), 6) for value in parts[1:5]]
+        except Exception:
+            continue
+        label = names.get(class_id, str(class_id))
+        counts[label] = counts.get(label, 0) + 1
+        labels.append({"class_id": class_id, "label": label, "xywhn": xywhn})
+    summary["objects"] = len(labels)
+    summary["labels"] = labels[:max_objects]
+    summary["label_counts"] = counts
+    if len(labels) > max_objects:
+        summary["truncated"] = len(labels) - max_objects
+    return summary
+
+
+def merge_counts(target: dict[str, int], source: dict[str, Any]) -> None:
+    for key, value in source.items():
+        try:
+            target[str(key)] = target.get(str(key), 0) + int(value)
+        except Exception:
+            continue
+
+
+def detection_label_counts(detections: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for item in detections:
+        for detection in item.get("detections", []) or []:
+            label = detection.get("label")
+            if label is None:
+                continue
+            counts[str(label)] = counts.get(str(label), 0) + 1
+    return counts
+
+
+def preferred_verdict(item: dict[str, Any]) -> dict[str, Any]:
+    multimodal = item.get("multimodal", {}) or {}
+    llm = multimodal.get("llm_refine", {}) or {}
+    if isinstance(llm, dict) and isinstance(llm.get("verdict"), dict):
+        return llm["verdict"]
+    vlm = multimodal.get("vlm", {}) or {}
+    return vlm.get("verdict", {}) if isinstance(vlm, dict) and isinstance(vlm.get("verdict"), dict) else {}
+
+
+def verdict_field_count(verdict: dict[str, Any], field: str) -> int:
+    cross_check = verdict.get("yolo_cross_check", {}) if isinstance(verdict, dict) else {}
+    if not isinstance(cross_check, dict):
+        return 0
+    value = cross_check.get(field)
+    if isinstance(value, list):
+        return len(value)
+    return 1 if value else 0
+
+
+def aggregate_multimodal_evaluation(items: list[dict[str, Any]]) -> dict[str, Any]:
+    status_counts: dict[str, int] = {}
+    gt_counts: dict[str, int] = {}
+    detection_counts: dict[str, int] = {}
+    flag_counts = {"confirmed": 0, "false_positives": 0, "possible_misses": 0, "duplicate_or_fragmented": 0}
+    parsed = 0
+    total_boxes = 0
+    total_gt_objects = 0
+    gt_available = 0
+    for item in items:
+        status = str(item.get("status", "unknown"))
+        status_counts[status] = status_counts.get(status, 0) + 1
+        detector = item.get("detector", {}) or {}
+        total_boxes += int(detector.get("boxes", 0) or 0)
+        merge_counts(detection_counts, detector.get("label_counts", {}) or {})
+        ground_truth = item.get("ground_truth", {}) or {}
+        if ground_truth.get("exists"):
+            gt_available += 1
+            total_gt_objects += int(ground_truth.get("objects", 0) or 0)
+            merge_counts(gt_counts, ground_truth.get("label_counts", {}) or {})
+        multimodal = item.get("multimodal", {}) or {}
+        vlm = multimodal.get("vlm", {}) or {}
+        llm = multimodal.get("llm_refine", {}) or {}
+        if vlm.get("verdict_parse_status") == "parsed" or llm.get("verdict_parse_status") == "parsed":
+            parsed += 1
+        verdict = preferred_verdict(item)
+        for field in flag_counts:
+            flag_counts[field] += verdict_field_count(verdict, field)
+    total = len(items)
+    return {
+        "images_processed": total,
+        "status_counts": status_counts,
+        "verdicts_parsed": parsed,
+        "verdict_parse_rate": round(parsed / total, 4) if total else 0.0,
+        "detections_total": total_boxes,
+        "ground_truth_total": total_gt_objects,
+        "ground_truth_images": gt_available,
+        "avg_detected_boxes": round(total_boxes / total, 4) if total else 0.0,
+        "avg_ground_truth_objects": round(total_gt_objects / gt_available, 4) if gt_available else None,
+        "detection_label_counts": detection_counts,
+        "ground_truth_label_counts": gt_counts,
+        "cross_check_flag_counts": flag_counts,
+    }
+
+
+def overall_multimodal_evaluation_status(aggregate: dict[str, Any]) -> str:
+    counts = aggregate.get("status_counts", {}) or {}
+    total = int(aggregate.get("images_processed", 0) or 0)
+    if total == 0:
+        return "failed"
+    if counts.get("ok") == total:
+        return "ok"
+    if counts.get("blocked") == total:
+        return "blocked"
+    if counts.get("failed") == total:
+        return "failed"
+    return "partial"
+
+
+def build_multimodal_evaluation_prompt(
+    base_prompt: str,
+    image_path: Path,
+    index: int,
+    total: int,
+    ground_truth: dict[str, Any],
+    *,
+    include_ground_truth: bool,
+) -> str:
+    prompt = (
+        f"{base_prompt}\n\n"
+        f"Evaluation image {index + 1}/{total}: {image_path.name}. "
+        "Focus on detector agreement, obvious false positives, likely missed objects, duplicates, and uncertainty."
+    )
+    if include_ground_truth:
+        prompt += "\n\nGround-truth labels for post-hoc comparison:\n" + json.dumps(ground_truth, ensure_ascii=False, indent=2)
+    return prompt
+
+
+def multimodal_prompt_from_request(request: dict[str, Any], params: dict[str, Any]) -> str:
+    return (
+        request.get("inputs", {}).get("prompt")
+        or params.get("prompt")
+        or params.get("question")
+        or "Explain the scene, verify the YOLO detections, and identify important missed or uncertain visual evidence."
+    )
+
+
+def run_multimodal_infer(request: dict[str, Any]) -> dict[str, Any]:
+    params = dict(request["params"])
+    yolo_params, multimodal_params = split_yolo_and_multimodal_params(params)
+    source = request["inputs"].get("source") or yolo_params.pop("source", None) or multimodal_params.get("source")
+    if source is None:
+        raise ValueError("`inputs.source` is required for yolo.multimodal.infer.")
+    prompt = multimodal_prompt_from_request(request, multimodal_params)
+    provider_cfg = openai_config(multimodal_params)
+    if provider_cfg["provider"] != "openai":
+        raise ValueError(f"Unsupported multimodal provider: {provider_cfg['provider']}")
+
+    max_items = int(yolo_params.pop("max_items", multimodal_params.get("max_reasoning_items", 3)))
+    max_boxes = int(multimodal_params.get("max_reasoning_boxes", 20))
+    thinking_with_image = parse_bool(multimodal_params.get("thinking_with_image"), True)
+    structured_output = parse_bool(multimodal_params.get("structured_output"), True)
+    max_output_tokens = int(multimodal_params.get("max_output_tokens", 1000 if structured_output else 800))
+    device_selection = resolve_device_selection(request, yolo_params)
+    yolo_params, chosen_device, auto_completed = apply_runtime_defaults(request, yolo_params, purpose="predict")
+    effective_request = deepcopy(request)
+    effective_request["params"] = yolo_params
+    effective_request["inputs"]["source"] = source
+
+    method = str(multimodal_params.get("method") or ("thinking-with-image" if thinking_with_image else "detector-text-reflection"))
+    if is_dry_run(request):
+        return plan_response(
+            effective_request,
+            "multimodal inference dry run prepared",
+            "orchestrator",
+            "yolo.multimodal.infer",
+            params={
+                "stages": [
+                    {"name": "yolo_predict", "executor": "python_api", "target": "YOLO(...).predict", "params": yolo_params},
+                    {
+                        "name": "vlm_reasoning",
+                        "executor": "openai.compatible",
+                        "provider": provider_cfg["provider"],
+                        "model": provider_cfg["vlm_model"],
+                        "api_mode": provider_cfg["api_mode"],
+                        "image": "input_image" if thinking_with_image else "text_only",
+                        "method": method,
+                        "structured_output": structured_output,
+                    },
+                    {
+                        "name": "llm_refine",
+                        "executor": "openai.compatible",
+                        "provider": provider_cfg["provider"],
+                        "model": provider_cfg["llm_model"],
+                        "api_mode": provider_cfg["api_mode"],
+                        "enabled": bool(provider_cfg.get("llm_model") or multimodal_params.get("enable_llm_refine")),
+                    },
+                ],
+                "prompt": prompt,
+            },
+            extra={
+                "environment": collect_environment_report(effective_request, selected_device=chosen_device),
+                "auto_completed": auto_completed,
+                "multimodal": {
+                    "provider": provider_cfg["provider"],
+                    "vlm_model": provider_cfg["vlm_model"],
+                    "llm_model": provider_cfg["llm_model"],
+                    "api_mode": provider_cfg["api_mode"],
+                    "api_key_env": provider_cfg["api_key_env"],
+                    "api_key_present": provider_cfg["api_key_present"],
+                    "method": method,
+                    "thinking_with_image": thinking_with_image,
+                    "structured_output": structured_output,
+                },
+            },
+        )
+
+    detections: list[dict[str, Any]]
+    save_dir = None
+    yolo_error = None
+    if bool(multimodal_params.get("skip_yolo", False)):
+        detections = json_safe(request["inputs"].get("detections") or multimodal_params.get("detections") or [])
+    else:
+        try:
+            model = build_model(effective_request)
+            results = model.predict(source=source, **yolo_params)
+        except Exception as exc:
+            if device_selection["source"] == "auto" and chosen_device not in (None, "cpu"):
+                retry_params = replace_cli_device(yolo_params, "cpu")
+                effective_request["params"] = retry_params
+                try:
+                    model = build_model(effective_request)
+                    results = model.predict(source=source, **retry_params)
+                    yolo_params = retry_params
+                    chosen_device = "cpu"
+                    auto_completed["device"] = "cpu"
+                    auto_completed["device_source"] = "recovery"
+                except Exception:
+                    raise exc
+            else:
+                raise
+        save_dir = getattr(model.predictor, "save_dir", None)
+        detections = summarize_results_for_reasoning(results, max_items=max_items, max_boxes=max_boxes)
+
+    image_ref = image_source_for_openai(source, detections)
+    vlm_result: dict[str, Any]
+    llm_result: dict[str, Any] | None = None
+    image_meta: dict[str, Any] = {
+        "requested": image_ref,
+        "thinking_with_image": thinking_with_image,
+        "attached": False,
+    }
+    if thinking_with_image and image_ref is None:
+        vlm_result = {
+            "status": "blocked",
+            "provider": "openai",
+            "summary": "No image source was available for multimodal reasoning.",
+        }
+    elif not provider_cfg["api_key_present"]:
+        vlm_result = {
+            "status": "blocked",
+            "provider": "openai",
+            "summary": "OPENAI_API_KEY is not set; multimodal reasoning was skipped.",
+            "api_key_env": provider_cfg["api_key_env"],
+        }
+    else:
+        try:
+            encoded_image = None
+            if thinking_with_image and image_ref is not None:
+                encoded_image = encode_image_reference_for_openai(
+                    image_ref,
+                    max_bytes=int(multimodal_params.get("max_image_bytes", 20_000_000)),
+                )
+                image_meta = {k: v for k, v in encoded_image.items() if k != "image_url"}
+                image_meta["thinking_with_image"] = True
+                image_meta["attached"] = True
+            user_text = build_thinking_with_image_prompt(
+                prompt,
+                detections,
+                method=method,
+                thinking_with_image=thinking_with_image,
+                structured_output=structured_output,
+            )
+            vlm_result = call_openai_compatible(
+                model=str(provider_cfg["vlm_model"]),
+                user_text=user_text,
+                developer_text=str(
+                    multimodal_params.get("developer_prompt")
+                    or multimodal_params.get("system_prompt")
+                    or "You are a careful visual reasoning assistant for YOLO-Master. Use the image and detector evidence, but only return concise evidence and uncertainty, not hidden chain-of-thought."
+                ),
+                image_url=encoded_image["image_url"] if encoded_image else None,
+                image_detail=str(multimodal_params.get("image_detail", "auto")),
+                base_url=provider_cfg["base_url"],
+                api_mode=str(provider_cfg["api_mode"]),
+                max_output_tokens=max_output_tokens,
+                temperature=float(multimodal_params["temperature"]) if "temperature" in multimodal_params else None,
+            )
+            vlm_result = attach_multimodal_verdict(vlm_result)
+        except Exception as exc:
+            vlm_result = {
+                "status": "failed",
+                "provider": "openai",
+                "summary": "Failed to prepare or call VLM reasoning.",
+                "error": {"type": type(exc).__name__, "message": str(exc)},
+            }
+
+    llm_enabled = bool(provider_cfg.get("llm_model") or multimodal_params.get("enable_llm_refine"))
+    if llm_enabled and vlm_result.get("status") == "ok":
+        llm_model = str(provider_cfg.get("llm_model") or provider_cfg["vlm_model"])
+        refine_prompt = (
+            "Refine this YOLO + VLM inference into a compact final answer. Do not add unsupported visual claims. "
+            "Return exactly one JSON object without Markdown fences. Use these keys: answer, visual_evidence, "
+            "yolo_cross_check, uncertainty, recommended_next_actions. In yolo_cross_check, include arrays named "
+            "confirmed, false_positives, possible_misses, duplicate_or_fragmented, and notes when applicable.\n\n"
+            f"User task:\n{prompt}\n\n"
+            f"YOLO detection summary:\n{json.dumps(json_safe(detections), ensure_ascii=False, indent=2)}\n\n"
+            f"VLM answer:\n{vlm_result.get('text', '')}\n\n"
+            f"Parsed VLM verdict:\n{json.dumps(json_safe(vlm_result.get('verdict', {})), ensure_ascii=False, indent=2)}"
+        )
+        llm_result = call_openai_compatible(
+            model=llm_model,
+            user_text=refine_prompt,
+            developer_text="You are a concise verifier. Return answer, evidence, uncertainty, and next actions.",
+            base_url=provider_cfg["base_url"],
+            api_mode=str(provider_cfg["api_mode"]),
+            max_output_tokens=max_output_tokens,
+            temperature=float(multimodal_params["temperature"]) if "temperature" in multimodal_params else None,
+        )
+        llm_result = attach_multimodal_verdict(llm_result)
+
+    overall_status = multimodal_overall_status(vlm_result, llm_result)
+    summary_map = {
+        "ok": "multimodal inference finished",
+        "blocked": "YOLO inference finished, but multimodal reasoning was blocked",
+        "partial": "YOLO inference finished; multimodal reasoning was incomplete",
+    }
+    summary = summary_map[overall_status]
+    environment = collect_environment_report(effective_request, selected_device=chosen_device)
+    payload = response(
+        request["skill"],
+        overall_status,
+        summary,
+        job={"mode": "sync", "save_dir": json_safe(save_dir), "executor": "python_api+openai", "device": chosen_device},
+        results=detections,
+        environment=environment,
+        auto_completed=auto_completed,
+        multimodal={
+            "method": method,
+            "thinking_with_image": thinking_with_image,
+            "structured_output": structured_output,
+            "provider": {
+                "name": provider_cfg["provider"],
+                "base_url": provider_cfg["base_url"],
+                "api_mode": provider_cfg["api_mode"],
+                "api_key_env": provider_cfg["api_key_env"],
+                "api_key_present": provider_cfg["api_key_present"],
+            },
+            "image": image_meta,
+            "prompt": prompt,
+            "vlm": vlm_result,
+            "llm_refine": llm_result or {"status": "skipped"},
+        },
+        next_actions=["yolo.predict", "yolo.val"],
+    )
+    if yolo_error:
+        payload["yolo_error"] = yolo_error
+    if save_dir:
+        payload["artifacts"] = [{"kind": "directory", "path": str(Path(save_dir).resolve())}]
+    payload["manifest"] = str(write_manifest(request, payload))
+    return payload
+
+
+def run_multimodal_evaluate(request: dict[str, Any]) -> dict[str, Any]:
+    params = dict(request["params"])
+    yolo_params, multimodal_params, evaluate_params = split_yolo_multimodal_evaluate_params(params)
+    prompt = multimodal_prompt_from_request(request, multimodal_params)
+    provider_cfg = openai_config(multimodal_params)
+    if provider_cfg["provider"] != "openai":
+        raise ValueError(f"Unsupported multimodal provider: {provider_cfg['provider']}")
+
+    thinking_with_image = parse_bool(multimodal_params.get("thinking_with_image"), True)
+    structured_output = parse_bool(multimodal_params.get("structured_output"), True)
+    max_output_tokens = int(multimodal_params.get("max_output_tokens", 1000 if structured_output else 800))
+    include_ground_truth = parse_bool(
+        evaluate_params.get("include_ground_truth_in_prompt", evaluate_params.get("include_ground_truth")),
+        False,
+    )
+    run_yolo_val = parse_bool(evaluate_params.get("run_yolo_val"), False)
+    continue_on_error = parse_bool(evaluate_params.get("continue_on_error"), True)
+    report_name = str(evaluate_params.get("report_name") or "multimodal-evaluation.json")
+    data_ref_for_baseline = request["inputs"].get("data") or evaluate_params.get("data") or yolo_params.get("data")
+    device_selection = resolve_device_selection(request, yolo_params)
+    yolo_params, chosen_device, auto_completed = apply_runtime_defaults(request, yolo_params, purpose="predict")
+    if "verbose" not in yolo_params:
+        yolo_params["verbose"] = False
+        auto_completed["verbose"] = False
+
+    effective_request = deepcopy(request)
+    effective_request["params"] = yolo_params
+    if request["inputs"].get("data") is not None:
+        effective_request["inputs"]["data"] = request["inputs"]["data"]
+    if request["inputs"].get("source") is not None:
+        effective_request["inputs"]["source"] = request["inputs"]["source"]
+
+    images, dataset_info, names = collect_multimodal_evaluation_images(request, evaluate_params, yolo_params, multimodal_params)
+    effective_request["inputs"]["source"] = str(images[0].parent)
+    environment = collect_environment_report(effective_request, selected_device=chosen_device)
+
+    if is_dry_run(request):
+        return plan_response(
+            effective_request,
+            "multimodal evaluation dry run prepared",
+            "orchestrator",
+            "yolo.multimodal.evaluate",
+            params={
+                "stages": [
+                    {"name": "collect_images", "executor": "dataset_or_source_resolver"},
+                    {"name": "yolo_predict_batch", "executor": "python_api", "target": "YOLO(...).predict"},
+                    {"name": "vlm_reasoning_batch", "executor": "openai.compatible"},
+                    {"name": "aggregate_report", "executor": "python"},
+                ],
+                "sample_count": len(images),
+                "sample_images": [str(path) for path in images[:10]],
+                "split": dataset_info.get("split"),
+                "run_yolo_val": run_yolo_val,
+                "include_ground_truth_in_prompt": include_ground_truth,
+                "prompt": prompt,
+            },
+            extra={
+                "environment": environment,
+                "auto_completed": auto_completed,
+                "multimodal": {
+                    "provider": provider_cfg["provider"],
+                    "vlm_model": provider_cfg["vlm_model"],
+                    "llm_model": provider_cfg["llm_model"],
+                    "api_mode": provider_cfg["api_mode"],
+                    "api_key_env": provider_cfg["api_key_env"],
+                    "api_key_present": provider_cfg["api_key_present"],
+                    "method": str(multimodal_params.get("method") or ("thinking-with-image" if thinking_with_image else "detector-text-reflection")),
+                    "thinking_with_image": thinking_with_image,
+                    "structured_output": structured_output,
+                    "dataset": dataset_info,
+                },
+            },
+        )
+
+    model = build_model(effective_request)
+    selected_device = chosen_device
+    items: list[dict[str, Any]] = []
+    save_dir = None
+    method = str(multimodal_params.get("method") or ("thinking-with-image" if thinking_with_image else "detector-text-reflection"))
+    llm_enabled = bool(provider_cfg.get("llm_model") or multimodal_params.get("enable_llm_refine"))
+
+    for index, image_path in enumerate(images):
+        image_item: dict[str, Any] = {
+            "path": str(image_path),
+            "index": index,
+            "ground_truth": read_ground_truth_summary(image_path, names),
+        }
+        image_prompt = build_multimodal_evaluation_prompt(
+            prompt,
+            image_path,
+            index,
+            len(images),
+            image_item["ground_truth"],
+            include_ground_truth=include_ground_truth,
+        )
+        yolo_prediction = None
+        try:
+            yolo_prediction = model.predict(source=str(image_path), **yolo_params)
+        except Exception as exc:
+            if device_selection["source"] == "auto" and selected_device not in (None, "cpu") and request.get("runtime", {}).get("allow_device_fallback", True):
+                retry_params = replace_cli_device(yolo_params, "cpu")
+                effective_request["params"] = retry_params
+                try:
+                    model = build_model(effective_request)
+                    yolo_prediction = model.predict(source=str(image_path), **retry_params)
+                    yolo_params = retry_params
+                    selected_device = "cpu"
+                    auto_completed["device"] = "cpu"
+                    auto_completed["device_source"] = "recovery"
+                except Exception as retry_exc:
+                    if not continue_on_error:
+                        raise retry_exc
+                    image_item["status"] = "failed"
+                    image_item["error"] = {"type": type(retry_exc).__name__, "message": str(retry_exc)}
+                    items.append(image_item)
+                    continue
+            elif continue_on_error:
+                image_item["status"] = "failed"
+                image_item["error"] = {"type": type(exc).__name__, "message": str(exc)}
+                items.append(image_item)
+                continue
+            else:
+                raise
+
+        detections = summarize_results_for_reasoning(yolo_prediction, max_items=1, max_boxes=int(multimodal_params.get("max_reasoning_boxes", 20)))
+        detection_summary = detections[0] if detections else {"path": str(image_path), "speed": {}, "detections": []}
+        image_ref = image_source_for_openai(str(image_path), detections)
+        image_meta: dict[str, Any] = {
+            "requested": image_ref,
+            "thinking_with_image": thinking_with_image,
+            "attached": False,
+        }
+        vlm_result: dict[str, Any]
+        llm_result: dict[str, Any] | None = None
+        if thinking_with_image and image_ref is None:
+            vlm_result = {
+                "status": "blocked",
+                "provider": "openai",
+                "summary": "No image source was available for multimodal reasoning.",
+            }
+        elif not provider_cfg["api_key_present"]:
+            vlm_result = {
+                "status": "blocked",
+                "provider": "openai",
+                "summary": "OPENAI_API_KEY is not set; multimodal reasoning was skipped.",
+                "api_key_env": provider_cfg["api_key_env"],
+            }
+        else:
+            try:
+                encoded_image = None
+                if thinking_with_image and image_ref is not None:
+                    encoded_image = encode_image_reference_for_openai(
+                        image_ref,
+                        max_bytes=int(multimodal_params.get("max_image_bytes", 20_000_000)),
+                    )
+                    image_meta = {k: v for k, v in encoded_image.items() if k != "image_url"}
+                    image_meta["thinking_with_image"] = True
+                    image_meta["attached"] = True
+                user_text = build_thinking_with_image_prompt(
+                    image_prompt,
+                    detections,
+                    method=method,
+                    thinking_with_image=thinking_with_image,
+                    structured_output=structured_output,
+                )
+                vlm_result = call_openai_compatible(
+                    model=str(provider_cfg["vlm_model"]),
+                    user_text=user_text,
+                    developer_text=str(
+                        multimodal_params.get("developer_prompt")
+                        or multimodal_params.get("system_prompt")
+                        or "You are a careful visual reasoning assistant for YOLO-Master. Use the image and detector evidence, but only return concise evidence and uncertainty, not hidden chain-of-thought."
+                    ),
+                    image_url=encoded_image["image_url"] if encoded_image else None,
+                    image_detail=str(multimodal_params.get("image_detail", "auto")),
+                    base_url=provider_cfg["base_url"],
+                    api_mode=str(provider_cfg["api_mode"]),
+                    max_output_tokens=max_output_tokens,
+                    temperature=float(multimodal_params["temperature"]) if "temperature" in multimodal_params else None,
+                )
+                vlm_result = attach_multimodal_verdict(vlm_result)
+            except Exception as exc:
+                vlm_result = {
+                    "status": "failed",
+                    "provider": "openai",
+                    "summary": "Failed to prepare or call VLM reasoning.",
+                    "error": {"type": type(exc).__name__, "message": str(exc)},
+                }
+
+        if llm_enabled and vlm_result.get("status") == "ok":
+            llm_model = str(provider_cfg.get("llm_model") or provider_cfg["vlm_model"])
+            refine_prompt = (
+                "Refine this YOLO + VLM evaluation into a compact final answer. Do not add unsupported visual claims. "
+                "Return exactly one JSON object without Markdown fences. Use these keys: answer, visual_evidence, "
+                "yolo_cross_check, uncertainty, recommended_next_actions. In yolo_cross_check, include arrays named "
+                "confirmed, false_positives, possible_misses, duplicate_or_fragmented, and notes when applicable.\n\n"
+                f"User task:\n{image_prompt}\n\n"
+                f"YOLO detection summary:\n{json.dumps(json_safe(detections), ensure_ascii=False, indent=2)}\n\n"
+                f"VLM answer:\n{vlm_result.get('text', '')}\n\n"
+                f"Parsed VLM verdict:\n{json.dumps(json_safe(vlm_result.get('verdict', {})), ensure_ascii=False, indent=2)}"
+            )
+            llm_result = call_openai_compatible(
+                model=llm_model,
+                user_text=refine_prompt,
+                developer_text="You are a concise verifier. Return answer, evidence, uncertainty, and next actions.",
+                base_url=provider_cfg["base_url"],
+                api_mode=str(provider_cfg["api_mode"]),
+                max_output_tokens=max_output_tokens,
+                temperature=float(multimodal_params["temperature"]) if "temperature" in multimodal_params else None,
+            )
+            llm_result = attach_multimodal_verdict(llm_result)
+
+        status = multimodal_overall_status(vlm_result, llm_result)
+        image_item.update(
+            {
+                "status": status,
+                "detector": {
+                    "boxes": len(detection_summary.get("detections", []) or []),
+                    "summary": detection_summary,
+                    "label_counts": detection_label_counts(detections),
+                },
+                "prompt": image_prompt,
+                "multimodal": {
+                    "method": method,
+                    "thinking_with_image": thinking_with_image,
+                    "structured_output": structured_output,
+                    "provider": {
+                        "name": provider_cfg["provider"],
+                        "base_url": provider_cfg["base_url"],
+                        "api_mode": provider_cfg["api_mode"],
+                        "api_key_env": provider_cfg["api_key_env"],
+                        "api_key_present": provider_cfg["api_key_present"],
+                    },
+                    "image": image_meta,
+                    "prompt": image_prompt,
+                    "vlm": vlm_result,
+                    "llm_refine": llm_result or {"status": "skipped"},
+                },
+            }
+        )
+        if status in {"blocked", "partial", "failed"}:
+            image_item["notes"] = ["See multimodal cross-check and detection summary for details."]
+        items.append(image_item)
+        save_dir = getattr(getattr(model, "predictor", None), "save_dir", save_dir)
+
+    aggregate = aggregate_multimodal_evaluation(items)
+    overall_status = overall_multimodal_evaluation_status(aggregate)
+    if run_yolo_val and data_ref_for_baseline not in (None, ""):
+        baseline_request = normalize_request(
+            {
+                "skill": "yolo.val",
+                "runtime": request.get("runtime", {}),
+                "inputs": {"model": request["inputs"]["model"], "data": data_ref_for_baseline},
+                "params": {k: v for k, v in yolo_params.items() if k not in {"source"}},
+                "artifacts": request.get("artifacts", {}),
+                "policy": request.get("policy", {}),
+                "request_id": f"{request.get('request_id', default_request_id('yolo.multimodal.evaluate'))}-baseline",
+            }
+        )
+        baseline = run_val(baseline_request)
+    else:
+        baseline = {"status": "skipped"}
+
+    final_selection_source = "recovery" if selected_device != chosen_device and selected_device == "cpu" else device_selection["source"]
+    environment = collect_environment_report(
+        effective_request,
+        selected_device=selected_device,
+        requested_device=chosen_device,
+        selection_source=final_selection_source,
+    )
+
+    report_dir = ensure_manifest_dir(request)
+    report_path = report_dir / report_name
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report = {
+        "skill": request.get("skill"),
+        "request_id": request.get("request_id"),
+        "dataset": dataset_info,
+        "aggregate": aggregate,
+        "baseline": baseline,
+        "items": items,
+        "environment": environment,
+        "auto_completed": auto_completed,
+        "multimodal": {
+            "method": method,
+            "thinking_with_image": thinking_with_image,
+            "structured_output": structured_output,
+            "provider": {
+                "name": provider_cfg["provider"],
+                "base_url": provider_cfg["base_url"],
+                "api_mode": provider_cfg["api_mode"],
+                "api_key_env": provider_cfg["api_key_env"],
+                "api_key_present": provider_cfg["api_key_present"],
+            },
+            "dataset": dataset_info,
+            "prompt": prompt,
+        },
+    }
+    report_path.write_text(json.dumps(json_safe(report), ensure_ascii=False, indent=2), encoding="utf-8")
+    artifacts = [{"kind": "json", "path": str(report_path.resolve())}]
+    if save_dir:
+        artifacts.append({"kind": "directory", "path": str(Path(save_dir).resolve())})
+
+    payload = response(
+        request["skill"],
+        overall_status,
+        f"multimodal evaluation finished on {len(items)} images",
+        job={"mode": "sync", "save_dir": json_safe(save_dir), "executor": "python_api+openai", "device": selected_device},
+        results=items,
+        evaluation=aggregate,
+        environment=environment,
+        auto_completed=auto_completed,
+        artifacts=artifacts,
+        multimodal=report["multimodal"],
+        baseline=baseline,
+        next_actions=["yolo.val", "yolo.multimodal.infer", "yolo.predict"],
+    )
+    payload["manifest"] = str(write_manifest(request, payload))
+    return payload
+
+
 def run_export(request: dict[str, Any]) -> dict[str, Any]:
     params = dict(request["params"])
     device_selection = resolve_device_selection(request, params)
@@ -2067,6 +3522,8 @@ HANDLERS = {
     "yolo.val": run_val,
     "yolo.predict": lambda request: run_predict_like(request, "predict"),
     "yolo.track": lambda request: run_predict_like(request, "track"),
+    "yolo.multimodal.infer": run_multimodal_infer,
+    "yolo.multimodal.evaluate": run_multimodal_evaluate,
     "yolo.export": run_export,
     "yolo.benchmark": run_benchmark,
     "yolo.tune": run_tune,

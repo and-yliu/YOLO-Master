@@ -273,6 +273,91 @@
     }
   },
   {
+    "name": "multimodal_infer_dry_run",
+    "suite": "dry-run",
+    "request": {
+      "skill": "yolo.multimodal.infer",
+      "inputs": {
+        "model": "ultralytics/cfg/models/master/v0_1/det/yolo-master-n.yaml",
+        "source": "ultralytics/assets/bus.jpg",
+        "prompt": "Summarize the important visual evidence and cross-check YOLO detections."
+      },
+      "params": {
+        "imgsz": 64,
+        "thinking_with_image": true,
+        "vlm_model": "gpt-4.1-mini",
+        "llm_model": "gpt-4.1-mini",
+        "openai_api_mode": "chat.completions",
+        "max_reasoning_items": 1,
+        "max_reasoning_boxes": 8
+      },
+      "artifacts": {},
+      "policy": {
+        "dry_run": true
+      }
+    },
+    "expect": {
+      "status": "ok",
+      "paths": [
+        "dry_run",
+        "plan.target",
+        "plan.params.stages.0.name",
+        "plan.params.stages.1.executor",
+        "plan.params.stages.2.enabled",
+        "multimodal.api_key_env"
+      ],
+      "equals": {
+        "plan.params.stages.1.image": "input_image",
+        "multimodal.method": "thinking-with-image",
+        "multimodal.thinking_with_image": true
+      },
+      "path_exists": ["manifest"]
+    }
+  },
+  {
+    "name": "multimodal_evaluate_dry_run",
+    "suite": "dry-run",
+    "request": {
+      "skill": "yolo.multimodal.evaluate",
+      "inputs": {
+        "model": "ultralytics/cfg/models/master/v0_1/det/yolo-master-n.yaml",
+        "source": "ultralytics/assets",
+        "prompt": "Batch-check sample images and summarize detector agreement."
+      },
+      "params": {
+        "limit": 2,
+        "split": "val",
+        "thinking_with_image": true,
+        "vlm_model": "gpt-4.1-mini",
+        "llm_model": "gpt-4.1-mini",
+        "openai_api_mode": "chat.completions",
+        "run_yolo_val": false
+      },
+      "artifacts": {},
+      "policy": {
+        "dry_run": true
+      }
+    },
+    "expect": {
+      "status": "ok",
+      "paths": [
+        "dry_run",
+        "plan.target",
+        "plan.params.stages.0.name",
+        "plan.params.sample_count",
+        "multimodal.dataset.source",
+        "multimodal.dataset.sample_count"
+      ],
+      "equals": {
+        "plan.target": "yolo.multimodal.evaluate",
+        "plan.params.stages.1.target": "YOLO(...).predict",
+        "multimodal.thinking_with_image": true,
+        "multimodal.api_key_env": "OPENAI_API_KEY"
+      },
+      "path_exists": ["manifest"]
+    }
+  },
+  {
     "name": "train_dry_run",
     "suite": "dry-run",
     "request": {
@@ -595,6 +680,168 @@
       "paths": ["error.type"],
       "nonempty": ["error.traceback"],
       "path_exists": ["manifest"]
+    }
+  },
+  {
+    "name": "multimodal_missing_openai_key_blocked",
+    "suite": "contract",
+    "env": {
+      "OPENAI_API_KEY": null
+    },
+    "request": {
+      "skill": "yolo.multimodal.infer",
+      "inputs": {
+        "model": "ultralytics/cfg/models/master/v0_1/det/yolo-master-n.yaml",
+        "source": "ultralytics/assets/bus.jpg",
+        "prompt": "Cross-check this image with the detector evidence."
+      },
+      "params": {
+        "skip_yolo": true,
+        "thinking_with_image": true,
+        "detections": [
+          {
+            "path": "ultralytics/assets/bus.jpg",
+            "detections": [
+              {
+                "label": "bus",
+                "confidence": 0.9,
+                "xyxy": [10, 20, 100, 160]
+              }
+            ]
+          }
+        ]
+      },
+      "artifacts": {},
+      "policy": {
+        "dry_run": false
+      }
+    },
+    "expect": {
+      "status": "blocked",
+      "returncode": 1,
+      "nonempty": ["results"],
+      "equals": {
+        "multimodal.vlm.status": "blocked",
+        "multimodal.provider.api_key_present": false,
+        "multimodal.image.attached": false
+      },
+      "paths": ["multimodal.vlm.summary", "multimodal.image.requested"],
+      "path_exists": ["manifest"]
+    }
+  },
+  {
+    "name": "multimodal_openai_stub_probe",
+    "suite": "contract",
+    "executor": "probe",
+    "request": {
+      "skill": "yolo.multimodal.infer",
+      "inputs": {
+        "model": "ultralytics/cfg/models/master/v0_1/det/yolo-master-n.yaml",
+        "source": "ultralytics/assets/bus.jpg",
+        "prompt": "Return the visual answer, evidence, uncertainty, and next actions."
+      },
+      "params": {
+        "skip_yolo": true,
+        "thinking_with_image": true,
+        "enable_llm_refine": true,
+        "vlm_model": "gpt-4.1-mini",
+        "llm_model": "gpt-4.1-mini",
+        "openai_base_url": "https://example.invalid/v1",
+        "openai_api_mode": "chat.completions",
+        "detections": [
+          {
+            "path": "ultralytics/assets/bus.jpg",
+            "detections": [
+              {
+                "label": "bus",
+                "confidence": 0.9,
+                "xyxy": [10, 20, 100, 160]
+              }
+            ]
+          }
+        ]
+      },
+      "artifacts": {},
+      "policy": {
+        "dry_run": false
+      }
+    },
+    "probe": {
+      "kind": "multimodal_stub",
+      "skill": "yolo.multimodal.infer"
+    },
+    "expect": {
+      "status": "ok",
+      "equals": {
+        "data.call_count": 2,
+        "data.vlm.status": "ok",
+        "data.llm_refine.status": "ok",
+        "data.image.kind": "local_file",
+        "data.image.attached": true
+      },
+      "contains": {
+        "data.vlm.text": "vlm answer",
+        "data.llm_refine.text": "refined answer"
+      },
+      "paths": [
+        "data.vlm.verdict.answer",
+        "data.llm_refine.verdict.yolo_cross_check.confirmed",
+        "data.calls.0.body.messages.1.content.1.image_url.url",
+        "data.calls.1.body.messages.1.content.0.text",
+        "payload.multimodal.provider.base_url"
+      ],
+      "path_exists": ["payload.manifest"]
+    }
+  },
+  {
+    "name": "multimodal_evaluate_stub_probe",
+    "suite": "contract",
+    "executor": "probe",
+    "env": {
+      "OPENAI_API_KEY": "stub-key"
+    },
+    "request": {
+      "skill": "yolo.multimodal.evaluate",
+      "inputs": {
+        "model": "ultralytics/cfg/models/master/v0_1/det/yolo-master-n.yaml",
+        "source": "ultralytics/assets",
+        "prompt": "Evaluate this image sample with YOLO and VLM evidence."
+      },
+      "params": {
+        "limit": 2,
+        "thinking_with_image": true,
+        "enable_llm_refine": true,
+        "vlm_model": "gpt-4.1-mini",
+        "llm_model": "gpt-4.1-mini",
+        "openai_base_url": "https://example.invalid/v1",
+        "openai_api_mode": "chat.completions"
+      },
+      "artifacts": {},
+      "policy": {
+        "dry_run": false
+      }
+    },
+    "probe": {
+      "kind": "multimodal_batch_stub",
+      "skill": "yolo.multimodal.evaluate"
+    },
+    "expect": {
+      "status": "ok",
+      "equals": {
+        "data.call_count": 6,
+        "data.aggregate.images_processed": 2,
+        "data.aggregate.verdict_parse_rate": 1.0,
+        "data.baseline_status": "skipped",
+        "payload.multimodal.dataset.sample_count": 2,
+        "payload.results.0.status": "ok"
+      },
+      "paths": [
+        "data.first_item.multimodal.vlm.verdict.answer",
+        "data.first_item.multimodal.llm_refine.verdict.yolo_cross_check.confirmed",
+        "payload.evaluation.cross_check_flag_counts.confirmed",
+        "payload.results.0.detector.summary.detections.0.label"
+      ],
+      "path_exists": ["payload.manifest", "payload.artifacts.0.path"]
     }
   },
   {

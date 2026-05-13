@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import importlib.util
 import json
 import os
@@ -22,6 +23,7 @@ SUITE_ALIASES = {
     "smoke": {"fast-smoke", "cli-smoke", "deep-smoke"},
     "extended": {"extended-cli"},
 }
+ENV_UNSET = object()
 
 
 def dotted_get(value: Any, path: str) -> Any:
@@ -48,6 +50,39 @@ def load_dispatcher_module() -> Any:
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def apply_env_overrides(env: dict[str, str], overrides: dict[str, Any] | None) -> dict[str, str]:
+    if not overrides:
+        return env
+    for key, value in overrides.items():
+        if value is None:
+            env.pop(key, None)
+        else:
+            env[key] = str(value)
+    return env
+
+
+@contextlib.contextmanager
+def temporary_env(overrides: dict[str, Any] | None):
+    if not overrides:
+        yield
+        return
+    previous: dict[str, Any] = {}
+    for key, value in overrides.items():
+        previous[key] = os.environ[key] if key in os.environ else ENV_UNSET
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = str(value)
+    try:
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is ENV_UNSET:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 def build_result(
@@ -132,7 +167,7 @@ def build_result(
 def run_dispatcher_case(case: dict[str, Any]) -> dict[str, Any]:
     request = dict(case["request"])
     cmd = [sys.executable, str(DISPATCHER), "--json", json.dumps(request, ensure_ascii=False)]
-    env = os.environ.copy()
+    env = apply_env_overrides(os.environ.copy(), case.get("env"))
     env["YOLO_MASTER_AGENT_RUNTIME_CACHE"] = "1"
     start = time.perf_counter()
     proc = subprocess.run(cmd, capture_output=True, text=True, cwd=REPO_ROOT, env=env)
@@ -246,6 +281,214 @@ def run_probe_case(case: dict[str, Any]) -> dict[str, Any]:
             },
         }
         return build_result(case, request, payload, elapsed=time.perf_counter() - start, returncode=0, stdout=stdout, stderr=stderr)
+    if kind == "multimodal_stub":
+        module = load_dispatcher_module()
+        calls: list[dict[str, Any]] = []
+        fake_outputs = iter(
+            [
+                json.dumps(
+                    {
+                        "answer": "vlm answer",
+                        "visual_evidence": ["image supports the bus detection"],
+                        "yolo_cross_check": {
+                            "confirmed": ["bus"],
+                            "false_positives": [],
+                            "possible_misses": [],
+                            "duplicate_or_fragmented": [],
+                            "notes": [],
+                        },
+                        "uncertainty": "low",
+                        "recommended_next_actions": ["continue validation"],
+                    }
+                ),
+                json.dumps(
+                    {
+                        "answer": "refined answer",
+                        "visual_evidence": ["detector and VLM agree"],
+                        "yolo_cross_check": {
+                            "confirmed": ["bus"],
+                            "false_positives": [],
+                            "possible_misses": [],
+                            "duplicate_or_fragmented": [],
+                            "notes": [],
+                        },
+                        "uncertainty": "low",
+                        "recommended_next_actions": ["continue validation"],
+                    }
+                ),
+            ]
+        )
+        original_urlopen = module.urllib.request.urlopen
+
+        class FakeResponse:
+            def __init__(self, payload: dict[str, Any]):
+                self.payload = payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return json.dumps(self.payload).encode("utf-8")
+
+        def fake_urlopen(request_obj, timeout=120):
+            body = json.loads(request_obj.data.decode("utf-8"))
+            calls.append({"url": request_obj.full_url, "body": body, "timeout": timeout})
+            text = next(fake_outputs, "fallback answer")
+            if request_obj.full_url.endswith("/chat/completions"):
+                payload = {
+                    "id": f"chat-{len(calls)}",
+                    "choices": [{"message": {"content": text}}],
+                    "usage": {"input_tokens": 8, "output_tokens": 4},
+                }
+            else:
+                payload = {
+                    "id": f"resp-{len(calls)}",
+                    "output_text": text,
+                    "usage": {"input_tokens": 8, "output_tokens": 4},
+                }
+            return FakeResponse(payload)
+
+        probe_env = dict(case.get("env") or {})
+        probe_env.setdefault("OPENAI_API_KEY", "stub-key")
+        with temporary_env(probe_env):
+            module.urllib.request.urlopen = fake_urlopen
+            try:
+                payload = module.run_multimodal_infer(module.normalize_request(request))
+            finally:
+                module.urllib.request.urlopen = original_urlopen
+        result_payload = {
+            "skill": probe.get("skill", "yolo.multimodal.infer"),
+            "status": payload.get("status", "failed"),
+            "summary": "multimodal stub probe finished",
+            "data": {
+                "call_count": len(calls),
+                "calls": calls,
+                "vlm": payload.get("multimodal", {}).get("vlm", {}),
+                "llm_refine": payload.get("multimodal", {}).get("llm_refine", {}),
+                "image": payload.get("multimodal", {}).get("image", {}),
+            },
+            "payload": payload,
+        }
+        return build_result(
+            case,
+            request,
+            result_payload,
+            elapsed=time.perf_counter() - start,
+            returncode=0 if payload.get("status") == "ok" else 1,
+            stdout=stdout,
+            stderr=stderr,
+        )
+    if kind == "multimodal_batch_stub":
+        module = load_dispatcher_module()
+        calls: list[dict[str, Any]] = []
+
+        class FakeArray(list):
+            def detach(self):
+                return self
+
+            def cpu(self):
+                return self
+
+            def tolist(self):
+                return list(self)
+
+        class FakeBoxes:
+            def __init__(self):
+                self.xyxy = FakeArray([[0.0, 0.0, 12.0, 12.0]])
+                self.cls = FakeArray([5])
+                self.conf = FakeArray([0.91])
+
+            def __len__(self):
+                return len(self.cls)
+
+        class FakeResult:
+            def __init__(self, path: str):
+                self.path = path
+                self.speed = {"preprocess": 1.0, "inference": 2.0, "postprocess": 3.0}
+                self.boxes = FakeBoxes()
+                self.names = {5: "bus"}
+
+        class FakeModel:
+            def __init__(self):
+                self.predictor = type("Predictor", (), {"save_dir": Path("/tmp")})()
+
+            def predict(self, source=None, **kwargs):
+                calls.append({"source": str(source), "kwargs": kwargs})
+                return [FakeResult(str(source))]
+
+        original_build_model = module.build_model
+        original_call_openai = module.call_openai_compatible
+
+        def fake_build_model(request):
+            return FakeModel()
+
+        def fake_call_openai_compatible(*, model, user_text, developer_text=None, image_url=None, image_detail="auto", base_url=None, api_mode="auto", max_output_tokens=800, temperature=None):
+            calls.append(
+                {
+                    "model": model,
+                    "api_mode": api_mode,
+                    "image_url": image_url,
+                    "user_text": user_text,
+                }
+            )
+            payload = {
+                "answer": "batch answer",
+                "visual_evidence": ["stub evidence"],
+                "yolo_cross_check": {
+                    "confirmed": ["bus"],
+                    "false_positives": [],
+                    "possible_misses": [],
+                    "duplicate_or_fragmented": [],
+                    "notes": [],
+                },
+                "uncertainty": "low",
+                "recommended_next_actions": ["continue validation"],
+            }
+            return {
+                "status": "ok",
+                "provider": "openai",
+                "api_mode": api_mode,
+                "model": model,
+                "text": json.dumps(payload),
+                "response_id": f"resp-{len(calls)}",
+                "usage": {"input_tokens": 8, "output_tokens": 4},
+            }
+
+        probe_env = dict(case.get("env") or {})
+        probe_env.setdefault("OPENAI_API_KEY", "stub-key")
+        with temporary_env(probe_env):
+            module.build_model = fake_build_model
+            module.call_openai_compatible = fake_call_openai_compatible
+            try:
+                payload = module.run_multimodal_evaluate(module.normalize_request(request))
+            finally:
+                module.build_model = original_build_model
+                module.call_openai_compatible = original_call_openai
+
+        result_payload = {
+            "skill": probe.get("skill", "yolo.multimodal.evaluate"),
+            "status": payload.get("status", "failed"),
+            "summary": "multimodal batch stub probe finished",
+            "data": {
+                "call_count": len(calls),
+                "aggregate": payload.get("evaluation", {}),
+                "baseline_status": payload.get("baseline", {}).get("status"),
+                "first_item": payload.get("results", [{}])[0] if payload.get("results") else {},
+            },
+            "payload": payload,
+        }
+        return build_result(
+            case,
+            request,
+            result_payload,
+            elapsed=time.perf_counter() - start,
+            returncode=0 if payload.get("status") in {"ok", "partial"} else 1,
+            stdout=stdout,
+            stderr=stderr,
+        )
     payload = {
         "skill": request.get("skill", "unknown"),
         "status": "failed",
@@ -291,6 +534,8 @@ def recommend(results: list[dict[str, Any]]) -> list[str]:
         recs.append("Refactor pipeline orchestration to surface stage-level errors and stage manifests.")
     if any(name.startswith("recovery_") for name in failed_names):
         recs.append("Keep the recovery probes green when adjusting auto device selection or CLI failure handling.")
+    if any(name.startswith("multimodal_") for name in failed_names):
+        recs.append("Keep the multimodal blocked-path, fake OpenAI probe, and thinking-with-image contract aligned.")
     if any(check["kind"] == "max_elapsed_sec" and not check["ok"] for r in failures for check in r["checks"]):
         recs.append("Preserve fast-smoke latency budgets with lazy imports or by moving expensive checks into deep-smoke.")
     if not recs:

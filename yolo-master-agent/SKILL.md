@@ -1,6 +1,6 @@
 ---
 name: yolo-master-agent
-description: Use when the user wants to train, validate, predict, track, export, benchmark, tune, inspect, or orchestrate YOLO-Master / Ultralytics experiments in this repository, including LoRA, MoE, and solutions workflows.
+description: Use when the user wants to train, validate, predict, track, export, benchmark, tune, inspect, or orchestrate YOLO-Master / Ultralytics experiments in this repository, including LoRA, MoE, multimodal inference/evaluation, and solutions workflows.
 ---
 
 # YOLO-Master Agent Skill
@@ -13,6 +13,8 @@ Use this skill for any repository task that should drive the YOLO-Master stack e
 - model inspection and task detection
 - LoRA save/load/merge
 - MoE diagnose/prune
+- multimodal visual inference with OpenAI VLM/LLM cooperation
+- multimodal batch evaluation over a dataset or image folder
 - `solutions` workflows
 - launchers for Gradio / Streamlit
 
@@ -37,6 +39,7 @@ python yolo-master-agent/scripts/validate_yolo_master_skill.py --suite quick --p
 ```
 
 `quick` is the default agent loop. It combines `fast-smoke`, `dry-run`, and `contract` so agents can iterate without waiting on real model inspection or CLI cold-start probes. Use `all` only when you explicitly want the slower full non-manual regression pass.
+The case pack now includes multimodal dry-run and contract probes for `yolo.multimodal.infer` and `yolo.multimodal.evaluate`.
 
 For quick regression checks, prefer the tiered suites:
 
@@ -64,6 +67,49 @@ python yolo-master-agent/scripts/validate_yolo_master_skill.py --suite all --pre
 9. Return structured artifacts, metrics, evaluation summaries, environment reports, and next actions.
 10. For long jobs, use `async`/launcher behavior and write a manifest.
 
+## Multimodal Inference
+
+`yolo.multimodal.infer` is an optional enhancement layer for visual reasoning. It does not replace `yolo.predict`: it runs YOLO first, condenses detections into reasoning evidence, then calls the OpenAI Responses API with `input_text` plus `input_image`, and optionally runs a second LLM refinement pass.
+
+Environment variables:
+
+- `OPENAI_API_KEY`
+- `OPENAI_BASE_URL` optional
+- `OPENAI_API_MODE` optional, `auto`, `responses`, or `chat.completions`
+- `OPENAI_VLM_MODEL` optional
+- `OPENAI_LLM_MODEL` optional
+- `structured_output=true` asks the VLM/LLM to return a strict JSON verdict that can be parsed into `verdict`
+
+Behavior:
+
+- `thinking_with_image=true` attaches the image to the VLM request
+- `enable_llm_refine=true` or `OPENAI_LLM_MODEL` enables the refinement pass
+- missing `OPENAI_API_KEY` returns a structured `blocked` result
+- DashScope/OpenAI-compatible chat endpoints can use `params.openai_api_mode="chat.completions"` with `OPENAI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1`
+- the manifest now preserves the `multimodal` block, including parsed verdicts when available
+
+Example:
+
+```bash
+python yolo-master-agent/scripts/run_yolo_master_skill.py --json '{"skill":"yolo.multimodal.infer","inputs":{"model":"yolo11n.pt","source":"ultralytics/assets/bus.jpg","prompt":"What matters most in this image?"},"params":{"thinking_with_image":true,"vlm_model":"gpt-4.1-mini","llm_model":"gpt-4.1-mini","max_reasoning_items":3,"max_reasoning_boxes":20},"policy":{"dry_run":true}}' --pretty
+```
+
+## Multimodal Batch Evaluation
+
+Use `yolo.multimodal.evaluate` when the agent needs to evaluate a real image sample or dataset split with YOLO first, then VLM/LLM cross-checks.
+
+- `inputs.data` selects a dataset YAML such as `coco128.yaml`; `params.split` defaults to `val`
+- `inputs.source` may point to a local image folder, image file, or image-list text file
+- `params.limit`, `offset`, `stride`, `shuffle`, and `seed` control sampling; `limit=0` means all resolved images
+- `params.run_yolo_val=true` also runs a YOLO-only validation baseline when `inputs.data` is available
+- Ground-truth labels are read for reporting when available; they are not added to the VLM prompt unless `include_ground_truth_in_prompt=true`
+
+Example:
+
+```bash
+python yolo-master-agent/scripts/run_yolo_master_skill.py --json '{"skill":"yolo.multimodal.evaluate","runtime":{"prefer_cli":true,"prefer_mps":true},"inputs":{"model":"yolo11n.pt","data":"coco128.yaml","prompt":"Cross-check detector outputs and summarize obvious false positives, misses, duplicates, and uncertainty."},"params":{"limit":5,"split":"val","imgsz":640,"batch":1,"thinking_with_image":true,"vlm_model":"qwen-vl-plus","llm_model":"qwen-plus","openai_base_url":"https://dashscope.aliyuncs.com/compatible-mode/v1","openai_api_mode":"chat.completions"},"policy":{"dry_run":false}}' --pretty
+```
+
 ## AutoTrain Loop
 
 Use the bundled validator and case pack to keep this skill honest:
@@ -82,6 +128,7 @@ Use the bundled validator and case pack to keep this skill honest:
 - `extended-cli` carries slower real CLI validation probes such as mini-dataset `yolo train` and `yolo val` on `mps`, and is marked `manual_only`
 - `contract` verifies failure-path behavior and manifest emission
 - `contract` now also includes in-process recovery probes so auto device fallback semantics stay covered without adding test-only hooks to the dispatcher
+- `contract` includes single-image and batch multimodal stub probes so OpenAI-compatible request shaping, structured verdict parsing, and aggregation stay covered
 - CLI failures now carry categorized hints so the agent can recover instead of stopping at a raw traceback.
 - Built-in dataset YAML names such as `coco128.yaml` are auto-resolved against the local repository before execution.
 - `doctor` returns environment, device selection source, and agent-facing recommendations.
