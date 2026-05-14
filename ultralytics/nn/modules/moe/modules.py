@@ -29,6 +29,21 @@ from .loss import MoELoss
 MOE_LOSS_REGISTRY = weakref.WeakKeyDictionary()
 
 
+def _zero_aux_loss_like(module: nn.Module) -> torch.Tensor:
+    """Return a scalar zero on the same device/dtype as the module parameters."""
+    try:
+        param = next(module.parameters())
+        return param.new_zeros(())
+    except StopIteration:
+        return torch.tensor(0.0)
+
+
+def _get_moe_aux_loss(module: nn.Module) -> torch.Tensor:
+    """Read the registered MoE aux loss, defaulting to a device-safe zero."""
+    loss = MOE_LOSS_REGISTRY.get(module)
+    return loss if isinstance(loss, torch.Tensor) else _zero_aux_loss_like(module)
+
+
 def _flatten_moe_topk(topk_tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
     """Normalize Top-K tensors to `[N, K]` for lightweight diagnostics.
 
@@ -298,7 +313,7 @@ class UltraOptimizedMoE(nn.Module):
     @property
     def aux_loss(self):
         """Retrieve the auxiliary loss from the registry."""
-        return MOE_LOSS_REGISTRY.get(self, torch.tensor(0.0))
+        return _get_moe_aux_loss(self)
 
     def __deepcopy__(self, memo):
         return _robust_deepcopy(self, memo)
@@ -477,7 +492,7 @@ class ES_MOE(nn.Module):
     @property
     def aux_loss(self):
         """Retrieve the auxiliary loss from the registry."""
-        return MOE_LOSS_REGISTRY.get(self, torch.tensor(0.0))
+        return _get_moe_aux_loss(self)
 
     def _dense_forward(self, x, routing_weights):
         """Dense forward: compute all experts (used during training)."""
@@ -731,7 +746,7 @@ class OptimizedMOE(nn.Module):
     @property
     def aux_loss(self):
         """Retrieve the auxiliary loss from the registry."""
-        return MOE_LOSS_REGISTRY.get(self, torch.tensor(0.0))
+        return _get_moe_aux_loss(self)
 
     def get_gflops(self, input_shape: Tuple[int, int, int, int]) -> Dict[str, float]:
         """Compute GFLOPs"""
@@ -931,7 +946,7 @@ class OptimizedMOEImproved(nn.Module):
     @property
     def aux_loss(self):
         """Retrieve the auxiliary loss from the registry."""
-        return MOE_LOSS_REGISTRY.get(self, torch.tensor(0.0))
+        return _get_moe_aux_loss(self)
 
 
 class ABlockMoE(ABlock):
@@ -992,8 +1007,7 @@ class A2C2fMoE(A2C2f):
     @property
     def aux_loss(self):
         """Retrieve the auxiliary loss from the registry."""
-        default = torch.tensor(0.0, device=next(self.parameters()).device)
-        return MOE_LOSS_REGISTRY.get(self, default)
+        return _get_moe_aux_loss(self)
 
     def get_gflops(self, input_shape: Tuple[int, int, int, int]) -> Dict[str, float]:
         """Accurate GFLOPs calculation"""
@@ -1157,7 +1171,7 @@ class HyperSplitMoE(nn.Module):
 
     @property
     def aux_loss(self):
-        return MOE_LOSS_REGISTRY.get(self, torch.tensor(0.0))
+        return _get_moe_aux_loss(self)
 
     def __deepcopy__(self, memo):
         return _robust_deepcopy(self, memo)
@@ -1324,7 +1338,7 @@ class HyperFusedMoE(nn.Module):
     
     @property
     def aux_loss(self):
-        return MOE_LOSS_REGISTRY.get(self, torch.tensor(0.0))
+        return _get_moe_aux_loss(self)
     
     def __deepcopy__(self, memo):
         return _robust_deepcopy(self, memo)
@@ -1754,7 +1768,7 @@ class HyperUltimateMoE(nn.Module):
     
     @property
     def aux_loss(self):
-        return MOE_LOSS_REGISTRY.get(self, torch.tensor(0.0))
+        return _get_moe_aux_loss(self)
     
     def get_gflops(self, input_shape):
         """Accurate FLOPs Calculation"""
@@ -1947,7 +1961,7 @@ class UltimateOptimizedMoE(nn.Module):
     
     @property
     def aux_loss(self):
-        return MOE_LOSS_REGISTRY.get(self, torch.tensor(0.0))
+        return _get_moe_aux_loss(self)
     
     def get_gflops(self, input_shape):
         B, C, H, W = input_shape

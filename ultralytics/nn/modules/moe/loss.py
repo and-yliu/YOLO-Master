@@ -37,6 +37,31 @@ class MoELoss(nn.Module):
         self.top_k = top_k
         self.use_soft_balancing = use_soft_balancing
 
+    @staticmethod
+    def _flatten_router_tensor(tensor: torch.Tensor) -> torch.Tensor:
+        """Normalize router tensors to `[N, num_experts]`.
+
+        Several MoE blocks emit global router tensors as `[B, E, 1, 1]` while
+        others emit `[B, E]`. Keeping the loss code shape-normalized prevents
+        accidental broadcasting between `[E, 1, 1]` and `[E]`.
+        """
+        if tensor.dim() == 2:
+            return tensor
+        if tensor.dim() == 4:
+            return tensor.permute(0, 2, 3, 1).reshape(-1, tensor.shape[1])
+        return tensor.reshape(-1, tensor.shape[-1])
+
+    @staticmethod
+    def _flatten_expert_indices(indices: torch.Tensor) -> torch.Tensor:
+        """Normalize Top-K index tensors to `[N, top_k]`."""
+        if indices.dim() == 2:
+            return indices
+        if indices.dim() == 4:
+            if indices.shape[1] <= 8:  # [B, K, H, W]
+                return indices.permute(0, 2, 3, 1).reshape(-1, indices.shape[1])
+            return indices.reshape(-1, indices.shape[-1])  # [B, H, W, K]
+        return indices.reshape(indices.shape[0], -1)
+
     def _get_global_mean(self, tensor: torch.Tensor) -> torch.Tensor:
         """Computes the mean of a tensor across all distributed processes."""
         if not (dist.is_available() and dist.is_initialized()):
@@ -68,6 +93,11 @@ class MoELoss(nn.Module):
             expert_outputs: [B, num_experts, D] Expert output features for diversity loss
             return_dict: If True, returns a dict with loss components for logging.
         """
+        router_probs = self._flatten_router_tensor(router_probs)
+        router_logits = self._flatten_router_tensor(router_logits)
+        if expert_indices is not None:
+            expert_indices = self._flatten_expert_indices(expert_indices)
+
         # 1. Load Balancing Loss
         importance = self._get_global_mean(router_probs)
 
@@ -150,8 +180,8 @@ class MoELoss(nn.Module):
                      (self.variance_loss_coeff * variance_loss)
         
         # NaN Guard (Graph Safe)
-        if torch.isnan(total_loss) or torch.isinf(total_loss):
-            total_loss = total_loss * 0.0
+        if not torch.isfinite(total_loss).all():
+            total_loss = torch.nan_to_num(total_loss, nan=0.0, posinf=0.0, neginf=0.0)
 
         if return_dict:
             return {

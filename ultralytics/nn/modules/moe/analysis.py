@@ -556,11 +556,16 @@ class RoutingCollapseDetector:
 
     def _get_expert_usage(self, module, num_experts: int):
         """Extract expert usage ratios from a MoE module's internal stats."""
-        # OptimizedMOEImproved / ModularRouterExpertMoE
-        if hasattr(module, 'routing') and hasattr(module.routing, 'router'):
-            # Can't easily get live stats without a forward pass
-            # Fall back to last_aux_loss / last_balance_loss if available
-            pass
+        snapshot = getattr(module, 'last_routing_snapshot', None)
+        if isinstance(snapshot, dict):
+            usage = snapshot.get('expert_usage')
+            if usage is None:
+                usage = snapshot.get('mean_router_probs')
+            if isinstance(usage, torch.Tensor) and usage.numel() >= num_experts:
+                values = usage.detach().float().cpu().reshape(-1)[:num_experts]
+                total = values.sum().item()
+                if total > 0:
+                    return [(values[i].item() / total) for i in range(num_experts)]
 
         # ES_MOE stores expert_usage_counts
         if hasattr(module, 'expert_usage_counts') and module.expert_usage_counts.numel() > 0:

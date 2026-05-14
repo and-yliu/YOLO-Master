@@ -770,8 +770,8 @@ class BaseTrainer:
                         # v3: Select teacher source (static or EMA)
                         teacher_source = self.teacher_ema if (use_ema and hasattr(self, 'teacher_ema') and self.teacher_ema is not None) else self.teacher_model
                         
+                        student_preds = self.model(batch["img"])
                         with torch.no_grad():
-                            student_preds = self.model(batch["img"])
                             teacher_preds = teacher_source(batch["img"])
                         
                         # Compute distillation loss
@@ -1716,7 +1716,7 @@ class BaseTrainer:
         loss_nan = self.loss is not None and not self.loss.isfinite()
         fitness_nan = self.fitness is not None and not np.isfinite(self.fitness)
         fitness_collapse = self.best_fitness and self.best_fitness > 0 and self.fitness == 0
-        corrupted = RANK in {-1, 0} and loss_nan and (fitness_nan or fitness_collapse)
+        corrupted = RANK in {-1, 0} and (loss_nan or fitness_nan or fitness_collapse)
         reason = "Loss NaN/Inf" if loss_nan else "Fitness NaN/Inf" if fitness_nan else "Fitness collapse"
         if RANK != -1:  # DDP: broadcast to all ranks
             broadcast_list = [corrupted if RANK == 0 else None]
@@ -1855,6 +1855,6 @@ class BaseTrainer:
         LOGGER.info(
             f"{colorstr('optimizer:')} {type(optimizer).__name__}(lr={lr}, momentum={momentum}) with parameter groups "
             f"{len(g[1])} bn(decay=0), {len(g[0])} wt(decay={decay}), {len(g[2])} bias(decay=0), "
-            f"{len(g[3])} router(lr=0.1x){lora_log}"
+            f"{len(g[3])} router(lr={moe_router_lr_scale:g}x){lora_log}"
         )
         return optimizer
