@@ -139,6 +139,18 @@ def _unfreeze_detection_head(model: nn.Module) -> int:
         )
     return head_unfrozen
 
+
+def _is_rtdetr_like_model(model: nn.Module) -> bool:
+    """Return True for RT-DETR models, including wrapped/proxy variants."""
+    if isinstance(model, RTDETRDetectionModel):
+        return True
+    for module in model.modules():
+        cls_name = module.__class__.__name__
+        if cls_name == "RTDETRDecoder" or "RTDETR" in cls_name:
+            return True
+    return False
+
+
 def _fast_parse_int_list(value: Any) -> Optional[List[int]]:
     """
     High-performance integer list parser.
@@ -2099,6 +2111,100 @@ class LoRAConfigBuilder:
 # 4. Main Entry Point
 # ============================================================================
 
+def _get_lora_runtime_value(
+    args: Any,
+    config: LoRAConfig,
+    arg_name: str,
+    config_name: Optional[str],
+    kwargs: Dict[str, Any],
+    default: Any = None,
+) -> Any:
+    """Resolve a runtime LoRA value from trainer args, config, kwargs, then default."""
+    value = None
+    if args is not None and not isinstance(args, LoRAConfig) and hasattr(args, arg_name):
+        value = getattr(args, arg_name, None)
+    if value is None and config_name:
+        value = getattr(config, config_name, None)
+    if value is None:
+        value = kwargs.get(arg_name, default)
+    return default if value is None else value
+
+
+def _set_lora_runtime_value(
+    args: Any,
+    config: LoRAConfig,
+    arg_name: str,
+    config_name: Optional[str],
+    kwargs: Dict[str, Any],
+    value: Any,
+) -> None:
+    """Keep trainer args, LoRAConfig, and kwargs in sync after a safety override."""
+    if config_name:
+        try:
+            setattr(config, config_name, value)
+        except Exception:
+            pass
+    if args is not None and not isinstance(args, LoRAConfig):
+        try:
+            setattr(args, arg_name, value)
+        except Exception:
+            pass
+    kwargs[arg_name] = value
+
+
+def _apply_rtdetr_lora_safety(
+    model: nn.Module,
+    args: Any,
+    config: LoRAConfig,
+    kwargs: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Apply conservative RT-DETR adapter stability defaults before training setup."""
+    if not _is_rtdetr_like_model(model):
+        return {}
+
+    changes: Dict[str, Any] = {}
+    LOGGER.warning(
+        "[LoRA] RT-DETR adapter fine-tuning detected. Applying stability guards: "
+        "keep AMP as configured, force lora_alpha_warmup>=3, cap lora_lr_mult<=1.0, "
+        "enable safe attention projections, and keep MSDeformAttn geometry layers "
+        "excluded from auto targets."
+    )
+
+    cur_warmup = _get_lora_runtime_value(
+        args, config, "lora_alpha_warmup", "alpha_warmup", kwargs, default=0
+    ) or 0
+    if cur_warmup < 3:
+        _set_lora_runtime_value(args, config, "lora_alpha_warmup", "alpha_warmup", kwargs, 3)
+        changes["lora_alpha_warmup"] = {"from": cur_warmup, "to": 3}
+        LOGGER.info(f"[LoRA] Force alpha_warmup = 3 for RT-DETR safety (was {cur_warmup}).")
+
+    cur_lr_mult = _get_lora_runtime_value(
+        args, config, "lora_lr_mult", "lr_mult", kwargs, default=2.0
+    )
+    if cur_lr_mult and cur_lr_mult > 1.0:
+        _set_lora_runtime_value(args, config, "lora_lr_mult", "lr_mult", kwargs, 1.0)
+        changes["lora_lr_mult"] = {"from": cur_lr_mult, "to": 1.0}
+        LOGGER.info(f"[LoRA] Cap lora_lr_mult = 1.0 for RT-DETR safety (was {cur_lr_mult}).")
+
+    if not bool(getattr(config, "include_attention", False)):
+        _set_lora_runtime_value(args, config, "lora_include_attention", "include_attention", kwargs, True)
+        changes["lora_include_attention"] = {"from": False, "to": True}
+        LOGGER.info(
+            "[LoRA] Enable safe attention projections for RT-DETR "
+            "(self_attn.out_proj, cross_attn.value_proj/output_proj remain allowed; "
+            "sampling_offsets/attention_weights stay excluded)."
+        )
+
+    if bool(getattr(config, "use_dora", False)):
+        LOGGER.warning(
+            "[LoRA] RT-DETR + DoRA is higher-risk than plain LoRA. "
+            "If NaN persists after the safety guard, retry with lora_use_dora=False "
+            "or restrict lora_target_modules to input_proj/query_pos/encoder layers."
+        )
+
+    return changes
+
+
 def apply_lora(
     model: "DetectionModel",
     args=None,
@@ -2198,6 +2304,8 @@ def apply_lora(
     if config.include_attention and not has_attn:
         config.include_attention = False
 
+    rtdetr_safety_changes = _apply_rtdetr_lora_safety(model, args, config, kwargs)
+
     # 2.6 YOLO12 Area-Attention safety guard.
     # AAttn uses Conv2d-based softmax attention; LoRA injection here easily causes
     # numerical collapse (symptom: loss drops to 0 and mAP/P/R become 0 mid-training).
@@ -2219,43 +2327,18 @@ def apply_lora(
             "(2) force alpha_warmup>=3 epochs if unset, (3) cap lora_lr_mult<=1.0."
         )
         # Resolve current values from args (preferred), then config, then kwargs.
-        cur_warmup = (
-            getattr(args, "lora_alpha_warmup", None)
-            if args is not None and not isinstance(args, LoRAConfig)
-            else getattr(config, "alpha_warmup", None)
-        )
-        cur_warmup = cur_warmup or 0
+        cur_warmup = _get_lora_runtime_value(
+            args, config, "lora_alpha_warmup", "alpha_warmup", kwargs, default=0
+        ) or 0
         if cur_warmup < 3:
-            try:
-                config.alpha_warmup = 3
-                if args is not None and not isinstance(args, LoRAConfig):
-                    try:
-                        setattr(args, "lora_alpha_warmup", 3)
-                    except Exception:
-                        pass
-                if "lora_alpha_warmup" in kwargs:
-                    kwargs["lora_alpha_warmup"] = 3
-                LOGGER.info(f"[LoRA] Force alpha_warmup = 3 for YOLO12 safety (was {cur_warmup}).")
-            except Exception:
-                pass
+            _set_lora_runtime_value(args, config, "lora_alpha_warmup", "alpha_warmup", kwargs, 3)
+            LOGGER.info(f"[LoRA] Force alpha_warmup = 3 for YOLO12 safety (was {cur_warmup}).")
         # Lower LR multiplier (attention LoRA layers are very LR-sensitive).
-        cur_lr_mult = (
-            getattr(args, "lora_lr_mult", None)
-            if args is not None and not isinstance(args, LoRAConfig)
-            else getattr(config, "lr_mult", None)
+        cur_lr_mult = _get_lora_runtime_value(
+            args, config, "lora_lr_mult", "lr_mult", kwargs, default=2.0
         )
-        cur_lr_mult = cur_lr_mult if cur_lr_mult is not None else kwargs.get("lora_lr_mult", 2.0)
         if cur_lr_mult and cur_lr_mult > 1.0:
-            try:
-                config.lr_mult = 1.0
-            except Exception:
-                pass
-            if args is not None and not isinstance(args, LoRAConfig):
-                try:
-                    setattr(args, "lora_lr_mult", 1.0)
-                except Exception:
-                    pass
-            kwargs["lora_lr_mult"] = 1.0
+            _set_lora_runtime_value(args, config, "lora_lr_mult", "lr_mult", kwargs, 1.0)
             LOGGER.info(f"[LoRA] Cap lora_lr_mult = 1.0 for YOLO12 safety (was {cur_lr_mult}).")
 
     # 3. Logging
@@ -2433,6 +2516,8 @@ def apply_lora(
             include_head=config.include_head,
             freeze_bn=bool(getattr(config, "freeze_bn", False)),
             target_modules=model.lora_target_modules,
+            safety_profile="rtdetr_lora" if rtdetr_safety_changes else None,
+            safety_overrides=rtdetr_safety_changes or None,
         )
         
         LOGGER.info(f"[LoRA] ✅ Successfully applied to {len(final_targets)} modules.")

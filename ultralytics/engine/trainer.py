@@ -109,6 +109,10 @@ def update_args_with_lora_runtime_metadata(args, model) -> None:
         args.requested_lora_init_lora_weights = metadata["requested_init_lora_weights"]
     if "effective_init_lora_weights" in metadata:
         args.effective_lora_init_lora_weights = metadata["effective_init_lora_weights"]
+    if metadata.get("safety_profile"):
+        args.lora_safety_profile = metadata["safety_profile"]
+    if metadata.get("safety_overrides"):
+        args.lora_safety_overrides = metadata["safety_overrides"]
 
 
 class BaseTrainer:
@@ -820,7 +824,7 @@ class BaseTrainer:
 
                 # LoRA collapse early detection:
                 # warn when loss stays zero/NaN for many consecutive iterations
-                # (typical symptom when LoRA injection breaks YOLO12 Area-Attention softmax).
+                # (typical symptom when adapter injection destabilizes attention or deformable transformer paths).
                 if self.lora_strategy is not None and RANK in {-1, 0}:
                     loss_val = float(self.loss.detach().item()) if self.loss is not None else 0.0
                     if not (loss_val == loss_val) or loss_val == 0.0:  # NaN or all-zero
@@ -830,7 +834,8 @@ class BaseTrainer:
                                 f"[LoRA] Detected {self._lora_zero_loss_streak} consecutive "
                                 f"zero/NaN losses — gradients may have collapsed. "
                                 f"Suggestion: reduce lora_lr_mult, exclude attn.{{qkv,proj,pe}} "
-                                f"from target_modules, or enable lora_alpha_warmup >= 3."
+                                f"from target_modules, enable lora_alpha_warmup >= 3, retry "
+                                f"with lora_use_dora=False, or compare an amp=False debug run."
                             )
                     else:
                         self._lora_zero_loss_streak = 0

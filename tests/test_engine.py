@@ -82,6 +82,8 @@ def test_update_args_with_lora_runtime_metadata_sets_requested_and_effective_fie
             "effective_backend": "fallback",
             "requested_init_lora_weights": "pissa",
             "effective_init_lora_weights": "gaussian",
+            "safety_profile": "rtdetr_lora",
+            "safety_overrides": {"lora_lr_mult": {"from": 2.0, "to": 1.0}},
         }
     )
 
@@ -91,6 +93,45 @@ def test_update_args_with_lora_runtime_metadata_sets_requested_and_effective_fie
     assert args.effective_lora_backend == "fallback"
     assert args.requested_lora_init_lora_weights == "pissa"
     assert args.effective_lora_init_lora_weights == "gaussian"
+    assert args.lora_safety_profile == "rtdetr_lora"
+    assert args.lora_safety_overrides == {"lora_lr_mult": {"from": 2.0, "to": 1.0}}
+
+
+def test_rtdetr_lora_safety_guard_mutates_training_args():
+    from ultralytics.utils.lora import LoRAConfig, _apply_rtdetr_lora_safety
+
+    class RTDETRDecoder(torch.nn.Module):
+        pass
+
+    args = SimpleNamespace(amp=True, lora_alpha_warmup=0, lora_lr_mult=2.0, lora_include_attention=False)
+    config = LoRAConfig(
+        r=16,
+        alpha=32,
+        lr_mult=2.0,
+        alpha_warmup=0,
+        include_attention=False,
+        use_dora=True,
+    )
+    kwargs = {}
+
+    changes = _apply_rtdetr_lora_safety(torch.nn.Sequential(RTDETRDecoder()), args, config, kwargs)
+
+    assert args.amp is True
+    assert args.lora_alpha_warmup == 3
+    assert args.lora_lr_mult == 1.0
+    assert args.lora_include_attention is True
+    assert config.alpha_warmup == 3
+    assert config.lr_mult == 1.0
+    assert config.include_attention is True
+    assert "amp" not in kwargs
+    assert kwargs["lora_alpha_warmup"] == 3
+    assert kwargs["lora_lr_mult"] == 1.0
+    assert kwargs["lora_include_attention"] is True
+    assert changes == {
+        "lora_alpha_warmup": {"from": 0, "to": 3},
+        "lora_lr_mult": {"from": 2.0, "to": 1.0},
+        "lora_include_attention": {"from": False, "to": True},
+    }
 
 
 def test_detect():
