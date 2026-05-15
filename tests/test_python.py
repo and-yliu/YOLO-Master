@@ -2,6 +2,7 @@
 
 import contextlib
 import csv
+import json
 import urllib
 from copy import copy
 from pathlib import Path
@@ -139,6 +140,196 @@ def test_merge_lora_weights_clears_peft_runtime_state():
         "use_gradient_checkpointing",
     ):
         assert not hasattr(model, attr)
+
+
+def test_load_fallback_adapter_state_restores_runtime_metadata(tmp_path):
+    """Test that fallback adapter loading restores saved top-level runtime metadata."""
+    from ultralytics.utils import lora as lora_utils
+
+    model = torch.nn.Module()
+    model.conv = torch.nn.Conv2d(3, 4, kernel_size=3, padding=1)
+
+    wrapped = lora_utils.ManualLoRAConv(torch.nn.Conv2d(3, 4, kernel_size=3, padding=1), r=2, alpha=4, dropout=0.1)
+    torch.save(
+        {
+            "modules": {"conv": {"r": 2, "alpha": 4, "dropout": 0.1}},
+            "state": {
+                "conv": {
+                    "lora_A": wrapped.lora_A.detach().clone(),
+                    "lora_B": wrapped.lora_B.detach().clone(),
+                }
+            },
+        },
+        tmp_path / "fallback_adapter.pt",
+    )
+
+    payload = {
+        "backend": "fallback",
+        "variant": "lora",
+        "weight_file": "fallback_adapter.pt",
+        "include_head": True,
+        "freeze_bn": True,
+        "target_modules": ["conv"],
+        "runtime_metadata": {"effective_backend": "fallback"},
+    }
+
+    loaded = lora_utils._load_fallback_adapter_state(model, tmp_path, payload)
+
+    assert getattr(loaded, "lora_enabled", False) is True
+    assert loaded.lora_backend == "fallback"
+    assert loaded.lora_variant == "lora"
+    assert loaded.lora_include_head is True
+    assert loaded.lora_freeze_bn is True
+    assert loaded.lora_target_modules == ["conv"]
+    assert loaded.lora_runtime_metadata == {"effective_backend": "fallback"}
+
+
+def test_load_lora_force_replace_clears_stale_fallback_runtime_state(tmp_path):
+    """Test that force-replacing fallback adapters clears stale top-level LoRA markers before reload."""
+    from ultralytics.utils import lora as lora_utils
+
+    adapter_dir = tmp_path / "adapter"
+    adapter_dir.mkdir()
+    (adapter_dir / "fallback_meta.json").write_text('{"backend":"fallback","weight_file":"fallback_adapter.pt"}')
+
+    model = torch.nn.Module()
+    model.model = torch.nn.Sequential()
+    model.lora_enabled = True
+    model.lora_backend = "fallback"
+    model.lora_include_head = True
+    model.lora_freeze_bn = True
+    model.lora_target_modules = ["old.conv"]
+    model.lora_runtime_metadata = {"stale": True}
+    model.use_gradient_checkpointing = True
+
+    def _fake_loader(current_model, path, payload):
+        assert not hasattr(current_model, "lora_include_head")
+        assert not hasattr(current_model, "lora_freeze_bn")
+        assert not hasattr(current_model, "lora_target_modules")
+        assert not hasattr(current_model, "lora_runtime_metadata")
+        assert not hasattr(current_model, "use_gradient_checkpointing")
+        return current_model
+
+    with mock.patch.object(lora_utils, "_load_fallback_adapter_state", side_effect=_fake_loader):
+        assert lora_utils.load_lora_adapters(model, adapter_dir, force_replace=True)
+
+
+def test_load_lora_adapters_restores_peft_runtime_metadata(tmp_path):
+    """Test that PEFT adapter loading restores saved runtime metadata onto the model."""
+    from ultralytics.utils import lora as lora_utils
+
+    runtime_payload = {
+        "backend": "peft",
+        "variant": "ia3",
+        "include_head": True,
+        "freeze_bn": True,
+        "target_modules": ["0.conv"],
+        "runtime_metadata": {"effective_backend": "peft"},
+    }
+    (tmp_path / "runtime_metadata.json").write_text(json.dumps(runtime_payload))
+
+    model = torch.nn.Module()
+    model.model = object()
+
+    class _DummyProxy:
+        peft_config = {"default": object()}
+
+        @classmethod
+        def from_pretrained(cls, base_model, path, is_trainable=False):
+            return cls()
+
+    def _fake_wrap(current_model, config):
+        current_model.lora_enabled = True
+        return current_model
+
+    with mock.patch.object(lora_utils, "PEFT_AVAILABLE", True), \
+         mock.patch.object(lora_utils, "PeftModel", _DummyProxy), \
+         mock.patch.object(lora_utils, "PeftProxy", _DummyProxy), \
+         mock.patch.object(lora_utils, "_wrap_top_level_lora_model", side_effect=_fake_wrap):
+        assert lora_utils.load_lora_adapters(model, tmp_path)
+
+    assert getattr(model, "lora_enabled", False) is True
+    assert model.lora_backend == "peft"
+    assert model.lora_variant == "ia3"
+    assert model.lora_include_head is True
+    assert model.lora_freeze_bn is True
+    assert model.lora_target_modules == ["0.conv"]
+    assert model.lora_runtime_metadata == {"effective_backend": "peft"}
+
+
+def test_load_lora_adapters_merge_true_calls_merge_for_peft(tmp_path):
+    """Test that PEFT adapter loading delegates to merge_lora_weights when merge=True."""
+    from ultralytics.utils import lora as lora_utils
+
+    model = torch.nn.Module()
+    model.model = object()
+
+    class _DummyProxy:
+        peft_config = {"default": object()}
+
+        @classmethod
+        def from_pretrained(cls, base_model, path, is_trainable=False):
+            return cls()
+
+    def _fake_wrap(current_model, config):
+        current_model.lora_enabled = True
+        return current_model
+
+    with mock.patch.object(lora_utils, "PEFT_AVAILABLE", True), \
+         mock.patch.object(lora_utils, "PeftModel", _DummyProxy), \
+         mock.patch.object(lora_utils, "PeftProxy", _DummyProxy), \
+         mock.patch.object(lora_utils, "_wrap_top_level_lora_model", side_effect=_fake_wrap), \
+         mock.patch.object(lora_utils, "merge_lora_weights", return_value=True) as merge_mock:
+        assert lora_utils.load_lora_adapters(model, tmp_path, merge=True)
+        merge_mock.assert_called_once_with(model)
+
+
+def test_merge_manual_lora_conv_preserves_forward_output():
+    """Test that merging a fallback LoRA conv reproduces the wrapped forward numerically."""
+    from ultralytics.utils.lora import ManualLoRAConv, _merge_manual_lora_conv
+
+    torch.manual_seed(0)
+    base_conv = torch.nn.Conv2d(3, 4, kernel_size=3, padding=1, bias=False)
+    wrapped = ManualLoRAConv(base_conv, r=2, alpha=4, dropout=0.0)
+    wrapped.lora_A.data.normal_(mean=0.0, std=0.2)
+    wrapped.lora_B.data.normal_(mean=0.0, std=0.2)
+
+    x = torch.randn(2, 3, 8, 8)
+    expected = wrapped(x)
+
+    merged = _merge_manual_lora_conv(wrapped)
+    actual = merged(x)
+
+    assert isinstance(merged, torch.nn.Conv2d)
+    assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-5)
+
+
+def test_unfreeze_detection_head_only_unfreezes_head_params():
+    """Test that LoRA head unfreeze only touches the detection head, not frozen backbone params."""
+    from ultralytics.nn.modules.head import Detect
+    from ultralytics.utils.lora import _unfreeze_detection_head
+
+    class _ToyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.stem = torch.nn.Conv2d(3, 8, kernel_size=3, padding=1)
+            self.detect = Detect(nc=2, ch=(8,))
+
+    model = _ToyModel()
+    for _, param in model.named_parameters():
+        param.requires_grad = False
+
+    unfrozen = _unfreeze_detection_head(model)
+    head_params = {
+        name for name, _ in model.named_parameters()
+        if name == "detect" or name.startswith("detect.")
+    }
+    trainable_params = {name for name, param in model.named_parameters() if param.requires_grad}
+
+    assert unfrozen > 0
+    assert trainable_params
+    assert trainable_params == head_params
+    assert all(not param.requires_grad for name, param in model.named_parameters() if name.startswith("stem."))
 
 
 def test_model_profile():

@@ -138,6 +138,42 @@ def test_rtdetr_lora_safety_guard_mutates_training_args():
     }
 
 
+def test_build_optimizer_separates_lora_params_with_lr_multiplier():
+    class _AdapterBlock(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(2, 2))
+            self.bias = torch.nn.Parameter(torch.zeros(2))
+            self.lora_A = torch.nn.Parameter(torch.ones(1, 2))
+            self.lora_B = torch.nn.Parameter(torch.ones(2, 1))
+
+    class _TinyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.block = _AdapterBlock()
+            self.bn = torch.nn.BatchNorm1d(2)
+
+    trainer = trainer_module.BaseTrainer.__new__(trainer_module.BaseTrainer)
+    trainer.args = SimpleNamespace(lora_lr_mult=3.0)
+    trainer.data = {}
+    model = _TinyModel()
+
+    optimizer = trainer_module.BaseTrainer.build_optimizer(
+        trainer, model, name="SGD", lr=0.01, momentum=0.9, decay=1e-4
+    )
+
+    lora_params = {id(model.block.lora_A), id(model.block.lora_B)}
+    lora_groups = [
+        pg for pg in optimizer.param_groups
+        if {id(param) for param in pg["params"]} == lora_params
+    ]
+
+    assert len(lora_groups) == 1
+    assert lora_groups[0]["lr"] == pytest.approx(0.03)
+    assert lora_groups[0]["initial_lr"] == pytest.approx(0.03)
+    assert lora_groups[0]["weight_decay"] == 0.0
+
+
 def test_detect():
     """Test YOLO object detection training, validation, and prediction functionality."""
     overrides = {"data": "coco8.yaml", "model": "yolo11n.yaml", "imgsz": 32, "epochs": 1, "save": False}

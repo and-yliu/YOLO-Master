@@ -989,6 +989,9 @@ def _load_fallback_adapter_state(model: nn.Module, path: Path, payload: Dict[str
     model.lora_enabled = True
     model.lora_backend = "fallback"
     model.lora_variant = payload.get("variant", "lora")
+    model.lora_include_head = payload.get("include_head", False)
+    model.lora_freeze_bn = payload.get("freeze_bn", False)
+    model.lora_target_modules = payload.get("target_modules", sorted(module_configs))
     model.lora_runtime_metadata = payload.get("runtime_metadata", {})
     return model
 
@@ -2876,8 +2879,7 @@ def load_lora_adapters(model: "DetectionModel", path: Union[str, Path], merge: b
             if hasattr(getattr(model, "model", None), "merge_and_unload"):
                 merge_lora_weights(model)
             else:
-                if hasattr(model, "lora_enabled"):
-                    delattr(model, "lora_enabled")
+                _clear_lora_runtime_state(model)
         else:
             LOGGER.warning("[LoRA] Model already has LoRA enabled. Skipping. Use force_replace=True to override.")
             return True
