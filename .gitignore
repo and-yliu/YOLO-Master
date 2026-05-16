@@ -172,6 +172,25 @@ cython_debug/
 runs/
 agent/logs/
 
+# LoRA/PEFT validation artifacts
+/yolo11n.pt
+/scripts/peft_validation/yolo11n.pt
+/scripts/peft_validation/peft_compare.log
+/scripts/peft_validation/peft_compare_curves.png
+/scripts/peft_validation/peft_compare_results.json
+/scripts/peft_validation/runs/
+
+# Paper build artifacts
+/paper/**/*.aux
+/paper/**/*.bbl
+/paper/**/*.blg
+/paper/**/*.log
+/paper/**/*.out
+/paper/**/*.pdf
+/paper/**/*.zip
+/paper/**/.DS_Store
+/paper/.DS_Store
+
 # PyCharm
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
 #  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
