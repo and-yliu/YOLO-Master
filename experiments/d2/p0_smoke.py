@@ -32,6 +32,14 @@ from ultralytics.utils import DEFAULT_CFG
 
 DEFAULT_RESULTS = Path(__file__).resolve().parent / "results" / "p0_smoke_dinov3.json"
 
+_LOG: list[str] = []
+
+
+def say(line: str = "") -> None:
+    """Print a line and keep it, so the run leaves a readable log beside the JSON."""
+    print(line)
+    _LOG.append(line)
+
 
 def synthetic_batch(batch_size: int, imgsz: int, device: torch.device, boxes_per_image: int = 3) -> dict:
     """Build a fixed, labelled detection batch so the real task loss can be computed alongside the KD term."""
@@ -92,9 +100,13 @@ def main() -> int:
         align_dim=args.align_dim,
     ).to(device)
 
-    print(f"\nteacher   : {args.teacher}  {tuple(target.shape)}")
-    print(f"student   : {args.student}  {args.level} @ layer {tap.source_index}  {tuple(student_feat.shape)}")
-    print(f"projector : {student_feat.shape[1]} / {target.shape[1]} -> align_dim {args.align_dim}\n")
+    say(f"\nrun       : {datetime.now(timezone.utc).isoformat()}")
+    say(f"env       : python {platform.python_version()}  torch {torch.__version__}  {platform.platform()}")
+    shown = " ".join("--{} {}".format(k.replace("_", "-"), v) for k, v in sorted(vars(args).items()))
+    say(f"args      : {shown}")
+    say(f"\nteacher   : {args.teacher}  {tuple(target.shape)}")
+    say(f"student   : {args.student}  {args.level} @ layer {tap.source_index}  {tuple(student_feat.shape)}")
+    say(f"projector : {student_feat.shape[1]} / {target.shape[1]} -> align_dim {args.align_dim}\n")
 
     # Teacher params are deliberately absent here; `teacher_ids` lets us assert that afterwards.
     params = list(student.parameters()) + [p for p in projector.parameters() if p.requires_grad]
@@ -140,7 +152,7 @@ def main() -> int:
         task_history.append(float(task_loss.item()))
         total_history.append(float(total_loss.item()))
         if step % max(1, args.steps // 10) == 0 or step == args.steps - 1:
-            print(
+            say(
                 f"  step {step:4d}  total {total_loss.item():10.4f}  "
                 f"task {task_loss.item():10.4f}  kd {kd_loss.item():.6f}"
             )
@@ -158,35 +170,31 @@ def main() -> int:
         # Alignment -- the student's grid is the one that must survive.
         "projector_preserves_student_grid": tuple(s_aligned.shape[-2:]) == tuple(student_feat.shape[-2:]),
         "teacher_grid_matches_student_natively": native_grid_match,
-
         # Numerics -- catches NaN/Inf and a silently disabled KD branch.
         "all_losses_finite": all(torch.isfinite(torch.tensor(v)) for v in every_loss),
         "kd_term_is_nonzero": kd_history[0] > 0,
-
         # Composition -- KD is optimized, not just logged beside the task loss.
         "kd_term_enters_total_loss": abs(total_history[0] - (task_history[0] + args.kd_weight * kd_history[0])) < 1e-4,
         "kd_gradient_reaches_student": kd_reaches_student,
         "projector_receives_gradient": projector_grad,
         "student_receives_gradient": student_grad,
-
         # Teacher stays inert -- frozen, unoptimized, and not learning through its own projection.
         "teacher_params_frozen": all(not p.requires_grad for p in teacher.parameters()),
         "teacher_absent_from_optimizer": not any(
             id(p) in teacher_ids for group in optimizer.param_groups for p in group["params"]
         ),
         "teacher_projection_frozen": projector.teacher_projection_frozen,
-        
         # Optimizable -- only KD must descend; total is noisy under dynamic assignment and BatchNorm.
         "kd_loss_descends_on_fixed_batch": kd_history[-1] < kd_history[0],
         "total_loss_improves_at_least_once": min(total_history) < total_history[0],
     }
     passed = all(checks.values())
 
-    print(f"\nkd   {kd_history[0]:.6f} -> {kd_history[-1]:.6f}  ({kd_history[0] / max(kd_history[-1], 1e-12):.1f}x)")
-    print(f"task {task_history[0]:.4f} -> {task_history[-1]:.4f}   (min {min(task_history):.4f})")
+    say(f"\nkd   {kd_history[0]:.6f} -> {kd_history[-1]:.6f}  ({kd_history[0] / max(kd_history[-1], 1e-12):.1f}x)")
+    say(f"task {task_history[0]:.4f} -> {task_history[-1]:.4f}   (min {min(task_history):.4f})")
     for name, value in checks.items():
-        print(f"  {'PASS' if value else 'FAIL'}  {name}")
-    print(f"\nP0 admission gate: {'PASS' if passed else 'FAIL'}\n")
+        say(f"  {'PASS' if value else 'FAIL'}  {name}")
+    say(f"\nP0 admission gate: {'PASS' if passed else 'FAIL'}\n")
 
     # --------------------------------------------------------------- evidence
 
@@ -210,7 +218,12 @@ def main() -> int:
     out = Path(args.results)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(record, indent=2, default=str), encoding="utf-8")
-    print(f"evidence written to {out.relative_to(ROOT) if out.is_relative_to(ROOT) else out}\n")
+
+    # JSON is for machines, the log is for a reader who wants to see what actually scrolled past.
+    log_path = out.with_suffix(".log")
+    say(f"evidence written to {out.relative_to(ROOT) if out.is_relative_to(ROOT) else out}")
+    log_path.write_text("\n".join(_LOG) + "\n", encoding="utf-8")
+    print(f"log written to {log_path.relative_to(ROOT) if log_path.is_relative_to(ROOT) else log_path}\n")
     return 0 if passed else 1
 
 

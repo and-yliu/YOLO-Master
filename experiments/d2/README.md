@@ -19,17 +19,42 @@
 | [`experiment_matrix.csv`](experiment_matrix.csv) | P1 无混杂变量 on/off 配对表 |
 | [`configs/`](configs/) | P1 成对配置；两份文件除"唯一变量"区块外应逐字相同 |
 | [`limitations.md`](limitations.md) | 已知局限、环境限制、风险触发与降级方案 |
-| [`results/`](results/) | 机器可读证据（JSON） |
+| [`results/`](results/) | 机器可读证据（JSON）与完整运行日志（`.log`） |
+
+## 环境安装
+
+```bash
+git clone -b d2 https://github.com/and-yliu/YOLO-Master.git
+cd YOLO-Master
+
+pip install -e .
+pip install "transformers>=5"     # 4.x 全线没有 DINOv3ViTBackbone，见 limitations.md §2.1
+hf auth login                     # DINOv3 权重受控，需已接受许可的账号 token
+```
+
+DINOv3 许可需本人在 [模型页](https://huggingface.co/facebook/dinov3-vits16-pretrain-lvd1689m) 登录并同意条款后才会放行，`hf auth login` 只是把 token 写到本地。
+
+验证环境就绪：
+
+```bash
+python -c "from transformers import DINOv3ViTBackbone; print('ok')"
+python -c "from ultralytics.nn.foundation import DINOv3Teacher; print('ok')"
+```
 
 ## 复现 P0
-
-需要 `transformers>=5` 与已接受的 DINOv3 许可（HF 上为 gated）。
 
 ```bash
 python experiments/d2/p0_smoke.py --steps 30
 ```
 
-结果写入 `results/p0_smoke_dinov3.json`。13 项检查全为 `true` 才算 P0 闭环。
+产物两份，写入 `results/`：
+
+| 文件 | 用途 |
+|---|---|
+| `p0_smoke_dinov3.json` | 机器可读证据：13 项检查、shape、对齐、完整 loss 序列、环境 |
+| `p0_smoke_dinov3.log` | 完整运行日志：时间戳、环境、全部参数、逐步 loss |
+
+13 项检查全为 `true` 才算 P0 闭环。
 
 其中两项最具判别力，因为它们区分"KD 真的接进了优化目标"与"KD 只是被算出来打印在旁边"：
 
