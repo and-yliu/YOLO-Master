@@ -7,17 +7,18 @@
 | **基线 commit** | `e9ac08b`（= `upstream/main`） |
 | **教师** | `facebook/dinov3-vits16-pretrain-lvd1689m`（冻结，仅训练期） |
 | **学生** | `yolo26-master-n`，蒸馏 P4（第 19 层） |
-| **P0 状态** | ✅ 已闭环，13/13 检查通过（CUDA） |
-| **P1 状态** | ⏳ 未启动 |
+| **P0 状态** | ⏳ 待跑：走 `trainer.py` 的真实训练路径核对 |
+| **P1 状态** | ⏳ 未启动；矩阵与配置已就绪（完整 2×2，15 次运行） |
 | **Owner** | *待定（尚未正式组队）* |
 
 ## 文档
 
 | 文件 | 内容 |
 |---|---|
-| [`design.md`](design.md) | 研究问题、教师选型依据、P0 原型设计、**判读线**、负结果归因顺序 |
-| [`experiment_matrix.csv`](experiment_matrix.csv) | P1 无混杂变量 on/off 配对表 |
-| [`configs/`](configs/) | P1 成对配置；两份文件除"唯一变量"区块外应逐字相同 |
+| [`kd_explained.md`](kd_explained.md) | **先读这份**：蒸馏机制的白话讲解，不假设 YOLO / DINOv3 / KD 背景 |
+| [`design.md`](design.md) | HEAD 能力地图、设计选择与依据、P0 定义、**判读线**、负结果归因顺序 |
+| [`experiment_matrix.csv`](experiment_matrix.csv) | P1 完整 2×2 矩阵：4 格 + 共享基线 × 3 seed = 15 次运行 |
+| [`configs/`](configs/) | P1 五份配置；除 `name` 与"唯一变量"区块外逐字相同，由 `validate_pair.py` 机械校验 |
 | [`limitations.md`](limitations.md) | 已知局限、环境限制、风险触发与降级方案 |
 | [`results/`](results/) | 机器可读证据（JSON）与完整运行日志（`.log`） |
 
@@ -43,43 +44,48 @@ python -c "from ultralytics.nn.foundation import DINOv3Teacher; print('ok')"
 
 ## 复现 P0
 
+P0 = **用配置驱动仓库自身的训练路径跑通一次真实训练**，并核对 teacher / tap / projector / loss 与日志。
+
 ```bash
-python experiments/d2/p0_smoke.py --steps 30
+yolo train model=ultralytics/cfg/models/26/yolo26-master-n.yaml \
+  data=coco128.yaml epochs=3 imgsz=256 batch=4 workers=0 device=0 \
+  seed=17 deterministic=True pretrained=False amp=False plots=False \
+  foundation_enabled=True foundation_teacher=dinov3 \
+  foundation_model=facebook/dinov3-vits16-pretrain-lvd1689m \
+  foundation_loss_weight=0.05 \
+  project=runs/d2/p0 name=train_ok
 ```
 
-产物两份，写入 `results/`：
+未显式给出的 foundation 参数取 `default.yaml` 默认值：`relational` 损失、`align_dim 256`、
+`target_levels [p4]`、`constant` 权重调度。
 
-| 文件 | 用途 |
+自动核对这条路径：
+
+```bash
+python experiments/d2/p0_path_check.py
+```
+
+产物 `results/p0_path_check.json`，5 项检查全为 `true` 才算 P0 闭环：
+
+| 检查 | 在问什么 |
 |---|---|
-| `p0_smoke_dinov3.json` | 机器可读证据：13 项检查、shape、对齐、完整 loss 序列、环境 |
-| `p0_smoke_dinov3.log` | 完整运行日志：时间戳、环境、全部参数、逐步 loss |
+| `wrapper_installed` | trainer 是否真的注入了 `FoundationDistillationModel`（`trainer.py:495`） |
+| `teacher_absent_from_optimizer` | 教师参数是否混进优化器 |
+| `foundation_in_loss_names` | KD 项是否出现在 loss 向量中（`trainer.py:533`） |
+| `kd_is_nonzero_and_finite` | KD 数值是否正常 |
+| `kd_reaches_results_csv` | 指标是否落盘（`trainer.py:833`） |
 
-13 项检查全为 `true` 才算 P0 闭环。
+其中最具判别力的是 `foundation_in_loss_names` 与 `kd_reaches_results_csv`——
+它们区分「KD 真的接进了优化目标」与「KD 只是被算出来打印在旁边」。
 
-其中两项最具判别力，因为它们区分"KD 真的接进了优化目标"与"KD 只是被算出来打印在旁边"：
+> **不构成任何精度主张。** 跑通只证明链路可优化，不证明泛化或 mAP 改善。
+> 是否涨点必须由 P1 的同预算多 seed 配对回答。证据 JSON 的 `claim` 字段固定为
+> `path_integrity_only_no_accuracy_claim`。
 
-- `kd_term_enters_total_loss` —— 数值校验 `total == task + w × kd`
-- `kd_gradient_reaches_student` —— 单独反传 KD 项，确认学生拿到非零梯度
+### 组件级辅助验证
 
-另有 `teacher_grid_matches_student_natively`：DINOv3 patch-16 与学生 stride-16 必须原生同格、零插值；若为 false 即配置有误。
-
-## P0 实测
-
-```
-teacher   facebook/dinov3-vits16-pretrain-lvd1689m   (2, 384, 16, 16)
-student   yolo26-master-n  p4 @ layer 19             (2, 128, 16, 16)
-projector 128 / 384 -> align_dim 64
-
-kd    0.999691 -> 0.756406
-task  28.1215  -> 22.1752
-P0 admission gate: PASS  (13/13)
-```
-
-Linux / CUDA 12.8 / torch 2.11.0，seed 17，30 步。完整证据见 [`results/p0_smoke_dinov3.json`](results/p0_smoke_dinov3.json)。
-
-KD 仅降 1.3× 与 `kd_weight=0.05` 一致：KD 项量级约 0.05，对上量级 28 的 task loss 本就只应轻推。**门槛是"接通且可优化"，不是下降幅度。**
-
-> **不构成任何精度主张。** 单 batch 下降只证明链路可优化，不证明泛化或 mAP 改善。是否涨点必须由 P1 的同预算多 seed 配对回答。
+`p0_smoke.py` 在合成 batch 上手工组装 tap / projector / loss，用于组件级排查。
+它**不属于 P0 关键路径**——合成数据上的 loss 下降不反映真实训练行为。
 
 ## 判读线
 

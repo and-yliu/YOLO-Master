@@ -2,10 +2,17 @@
 
 ## 1. 当前证据的边界
 
-- **P0 不构成精度主张。** 准入 smoke 使用单个固定合成 batch，只证明 stage 对齐、投影、损失与梯度链路成立且可优化。它既不证明泛化，也不证明 mAP 改善。证据 JSON 的 `claim` 字段固定为 `plumbing_only_no_accuracy_claim`。
-- **P0 使用合成 batch 而非真实数据。** 这是刻意的：合成 batch 让准入门不依赖数据集下载与 dataloader，从而在任何环境下都能一条命令复现。代价是它不反映真实数据的框分布与类别分布，因此**只能用于链路验证，不能用于任何数值结论**。
+- **P0 不构成精度主张。** P0 走 `trainer.py` 的真实训练路径，只证明配置驱动的链路接通、
+  KD 进入被优化的目标、指标落盘。它既不证明泛化，也不证明 mAP 改善。证据 JSON 的 `claim`
+  字段固定为 `path_integrity_only_no_accuracy_claim`。
+- **`p0_smoke.py` 只是组件级辅助验证。** 它在合成 batch 上手工组装 tap / projector / loss，
+  不经过 trainer。合成数据上的 loss 下降是必然的（网络背下固定的几张图而已），
+  **不能用于任何数值结论，也不能替代 P0**。
 - **`coco128` 方差过大。** P1 采用它是为了在单卡预算内跑通多 seed 配对，其结果只能支撑"是否值得继续投入"的 go/no-go 判断，**不足以作论文级涨点结论**。
-- **单 stage、单教师。** P0/P1 只蒸馏 P4、只用 DINOv3-ViT-S/16。多尺度（`foundation_multiscale`）、多教师路由（`FoundationTeacherRouter`）、语义蒸馏（`semantic.py`）、relational / hybrid 损失、前景加权与 `gate_decay` 调度均为上游已有能力，但**属于 P2 消融范围，P0/P1 不启用**。
+- **单 stage、单教师。** P0/P1 只蒸馏 P4（`foundation_target_levels: [p4]`）、只用 DINOv3-ViT-S/16，
+  损失沿用默认 `relational`。多尺度（`foundation_multiscale`）、SigLIP2 与多教师路由、
+  语义蒸馏（`semantic.py`）、前景加权与 `gate_decay` 调度均为**本仓库已实现但 P0/P1 不启用**的能力，
+  属于 2×2 扩展与后续消融范围（见 `design.md §7.2`）。这些能力上游 Ultralytics 不存在。
 - **教师特征未缓存。** 教师冻结且只前向一次，理论上可缓存；但缓存与几何增强不兼容，会引入额外变量。P1 不启用缓存。若后续启用，缓存键至少须包含教师 repo、revision、权重 SHA-256、预处理版本、数据样本 ID 与目标 level。
 
 ## 2. 环境前提
