@@ -5,9 +5,11 @@
 - **P0 不构成精度主张。** P0 走 `trainer.py` 的真实训练路径，只证明配置驱动的链路接通、
   KD 进入被优化的目标、指标落盘。它既不证明泛化，也不证明 mAP 改善。证据 JSON 的 `claim`
   字段固定为 `path_integrity_only_no_accuracy_claim`。
-- **`p0_smoke.py` 只是组件级辅助验证。** 它在合成 batch 上手工组装 tap / projector / loss，
-  不经过 trainer。合成数据上的 loss 下降是必然的（网络背下固定的几张图而已），
-  **不能用于任何数值结论，也不能替代 P0**。
+- **P0 只有 3 个 epoch，mAP50-95 全程为 0。** 模型尚未开始收敛，因此这份证据**只能读作
+  「链路接通」**，任何关于蒸馏是否有效的推断都必须等 P1。
+- **早期的两个组件级脚本已移除。** `p0_smoke.py`（合成 batch 上手工组装 tap/projector/loss）
+  与 `p0_path_check.py`（回调式路径审计）的结论已被真实训练的 `results.csv` 全部覆盖，
+  保留会造成「哪份才是 P0 证据」的歧义。二者可从 Git 历史取回。
 - **`coco128` 方差过大。** P1 采用它是为了在单卡预算内跑通多 seed 配对，其结果只能支撑"是否值得继续投入"的 go/no-go 判断，**不足以作论文级涨点结论**。
 - **单 stage、单教师。** P0/P1 只蒸馏 P4（`foundation_target_levels: [p4]`）、只用 DINOv3-ViT-S/16，
   损失沿用默认 `relational`。多尺度（`foundation_multiscale`）、SigLIP2 与多教师路由、
@@ -17,9 +19,41 @@
 
 ## 2. 环境前提
 
-### 2.1 `foundation` extra 的依赖 pin 有误（可提交上游的缺陷）
+### 2.1 `foundation` extra 的依赖下界有误（可提交上游的缺陷）
 
-`pyproject.toml` 声明 `foundation = ["transformers>=4.56.0,<6"]`，但 `ultralytics/nn/foundation/teachers/dinov3.py:133` 导入的 `DINOv3ViTBackbone` **在整个 transformers 4.x 中都不存在**（4.x 线终止于 4.57；该类首见于 5.x）。按文档安装会直接失败，实际可用下界是 `transformers>=5`。
+`pyproject.toml:96` 声明 `foundation = ["transformers>=4.56.0,<6; python_version >= '3.10'"]`，
+但 `ultralytics/nn/foundation/teachers/dinov3.py:133` 导入的 `DINOv3ViTBackbone`
+**在该 pin 允许的整个 4.x 区间内都不存在**，因此按文档安装必然 ImportError。
+
+实测（2026-08-25，CUDA 服务器）：
+
+| transformers | `dir(transformers)` 中的 DINOv3 符号 | `DINOv3ViTBackbone` |
+|---|---|---|
+| 4.57.0 | `DINOv3ConvNextConfig/Model/PreTrainedModel`、`DINOv3ViTConfig`、`DINOv3ViTImageProcessorFast`、`DINOv3ViTModel`、`DINOv3ViTPreTrainedModel` | ❌ |
+| 5.15.1 | 上述 + `DINOv3ConvNextBackbone`、`DINOv3ViTBackbone`、`DINOv3ViTImageProcessor` | ✅ |
+
+**注意归因**：4.x 并非没有 DINOv3 支持——4.57 有完整的 `DINOv3ViTModel`，
+只是**不导出 `Backbone` 变体**。（transformers 对 DINOv2 是提供 `Dinov2Backbone` 的，
+类名大概是按 v2 的惯例推得，未经实际验证。）
+
+**已验证的边界**：4.57.0 不可用，5.15.1 可用。**5.x 中最早可用的具体版本未逐版本核实**，
+因此提交上游前应先确认，不应直接断言 `>=5.0`。
+
+受影响的位置（改 pin 时须同步）：
+
+- `pyproject.toml:96` —— 依赖下界
+- `ultralytics/nn/foundation/teachers/dinov3.py:136` —— 错误提示字符串
+- `ultralytics/nn/foundation/teachers/siglip2.py:137`、`:168` —— 同上
+
+### 2.1.1 该路径从未被测试覆盖（测试缺口）
+
+`grep -rn "DINOv3ViTBackbone" ultralytics/ tests/` 只命中 `dinov3.py:133` 与 `:144`，
+测试中零命中。全部 foundation 测试均注入 `DummyTeacher` 或自定义 `model_loader`
+（如 `tests/test_foundation_dinov3.py:114` 的
+`test_model_loader_is_injected_without_transformers_or_network_access`），
+**真实 transformers 后端一次都没有被执行过**。这解释了缺陷为何能长期存在。
+
+修复建议应同时包含一个在 transformers 可用时才运行的导入冒烟测试（否则同类问题会复发）。
 
 ### 2.2 教师权重受控访问
 

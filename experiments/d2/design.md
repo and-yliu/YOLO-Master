@@ -172,33 +172,103 @@ yolo train model=ultralytics/cfg/models/26/yolo26-master-n.yaml \
   foundation_enabled=True foundation_teacher=dinov3 \
   foundation_model=facebook/dinov3-vits16-pretrain-lvd1689m \
   foundation_loss_weight=0.05 \
-  project=runs/d2/p0 name=train_ok
+  project=d2/p0 name=train_ok
 ```
 
 未显式给出的 foundation 参数全部取 `default.yaml` 默认值
 （`relational` / `align_dim 256` / `[p4]` / `constant`），与 §4 的设计选择一致。
+实际生效值见 `results/p0_train_ok/resolved_args.yaml`。
 
-### 5.3 自动核对
+### 5.3 实测结果（2026-08-25，CUDA）
 
-```bash
-python experiments/d2/p0_path_check.py
+证据：[`results/p0_train_ok/metrics.csv`](results/p0_train_ok/metrics.csv)、
+[`results/p0_train_ok/resolved_args.yaml`](results/p0_train_ok/resolved_args.yaml)。
+环境 torch 2.11.0+cu128 / driver CUDA 12.8 / 单卡。
+
+| epoch | box | cls | dfl | mixture_aux | foundation | relational_raw | task_ratio |
+|---|---|---|---|---|---|---|---|
+| 1 | 3.5953 | 5.5975 | 0.0571 | 2.9874 | 0.06290 | 0.31452 | 0.00404 |
+| 2 | 3.6781 | 5.6266 | 0.0567 | 2.2537 | 0.06261 | 0.31303 | 0.00422 |
+| 3 | 3.6498 | 5.6226 | 0.0571 | 1.6700 | 0.06029 | 0.30145 | 0.00426 |
+
+**P0 的四项核对全部由这份 CSV 直接证成**，无需额外脚本：
+
+| 核对项 | 证据 |
+|---|---|
+| wrapper 已注入 | `train/foundation` 等 11 个 foundation 列存在——只有 wrapper 会产生它们 |
+| KD 进入 loss 向量 | `loss_names` 含 `foundation`（CSV 表头） |
+| KD 数值正常 | 三个 epoch 均为有限非零值 |
+| 指标落盘 | 即这份 CSV 本身 |
+
+**权重恒等式（最具判别力的一项）**，用 CSV 的数字直接验证：
+
+```
+foundation_relational_raw × foundation_loss_weight × batch_size
+0.314517 × 0.05 × 4 = 0.0629034 = train/foundation_loss   ✓ 三个 epoch 全部精确相等
 ```
 
-以回调挂在真实 `DetectionTrainer` 上，输出 `results/p0_path_check.json`：
+这证明配置里的 `0.05` **真的作用到了被优化的目标上**，而不是被算出来打印在旁边。
 
-| 检查 | 在问什么 |
-|---|---|
-| `wrapper_installed` | trainer 是否真的注入了 `FoundationDistillationModel` |
-| `teacher_absent_from_optimizer` | 教师参数是否混进优化器 |
-| `foundation_in_loss_names` | KD 项是否出现在 loss 向量中 |
-| `kd_is_nonzero_and_finite` | KD 数值是否正常 |
-| `kd_reaches_results_csv` | 指标是否落盘 |
+另有两项符合设计的行为需说明，以免被误读为故障：
 
-`claim` 字段固定为 `path_integrity_only_no_accuracy_claim`。
+- `foundation_cosine_raw = 0` —— `loss=relational` 时 cosine 分量按设计返回零
+  （`_kd_components_with_weights`），非 bug
+- `val/foundation = 0` —— eval 模式下 wrapper 直接补零（`foundation_distill_model.py:943`）
 
-### 5.4 P0 不主张什么
+一项未被 CSV 覆盖的核对：**教师参数不在 optimizer 中**。该性质由 `trainer.py:563-572`
+的冻结名单保证，属代码不变量而非运行时变量；已于 2026-08-25 在同一环境下实测确认为 true
+（遍历 `optimizer.param_groups` 与 `teacher_manager.parameters()` 无交集）。
 
-> **P0 不构成任何精度主张。** 它只证明这条路径接通且可优化，既不证明泛化，也不证明 mAP 改善。
+> 若日后需重新确认此项，应作为单元测试加进 `tests/`，而非实验脚本——
+> 它检验的是代码不变量，与具体实验无关。
+
+### 5.4 P0 暴露的三个问题
+
+**① KD 权重过小。** `foundation_task_ratio ≈ 0.4%`——蒸馏项仅占检测损失的千分之四。
+§4.6 写的是「轻推而非主导」，但 0.4% 恐怕接近于没有推。
+**这直接威胁 P1 的可解释性**：若 P1 得出 `|ΔmAP| < 0.3`，最合理的解释将是「权重太小」
+而非「基础模型特征无用」，15 次运行的成本会换回一个无法归因的结论。
+处置见 §5.5。
+
+**② MoE 辅助损失量级压倒 KD。** `mixture_aux_loss` 是 `foundation` 的 **26 倍**
+（1.67 vs 0.0603），且三个 epoch 内下降 44%，说明 MoE 路由远未稳定。
+蒸馏信号被埋在一个更大且剧烈变化的辅助项之下。这为 §8 第 5 条「MoE 交互」
+提供了直接数值证据，不再是推测。
+
+**③ optimizer 与 P1 配置不一致。** 本次 `args.yaml` 记录 `optimizer: auto`
+（命令行未指定），实际学习率约 3.7e-05；而 `configs/p1_*.yaml` 写的是 `SGD` + `lr0 0.01`。
+这在 P1 内部不构成混杂（两臂一致），但**P0 的数值不能与 P1 直接比较**。
+
+### 5.5 P1 之前的权重标定
+
+基于 §5.4 ①，在锁定 P1 之前先做一次短扫描确定 `foundation_loss_weight`：
+
+```bash
+for w in 0.05 0.25 1.0 2.0; do
+  yolo train model=ultralytics/cfg/models/26/yolo26-master-n.yaml \
+    data=coco128.yaml epochs=5 imgsz=256 batch=4 workers=0 device=0 \
+    seed=17 deterministic=True pretrained=False amp=False plots=False \
+    optimizer=SGD lr0=0.01 \
+    foundation_enabled=True foundation_teacher=dinov3 \
+    foundation_model=facebook/dinov3-vits16-pretrain-lvd1689m \
+    foundation_loss_weight=$w \
+    project=d2/p0 name=wsweep_$w
+done
+```
+
+**选取准则（先于扫描提交）**：取使 `foundation_task_ratio` 落入 **5%–20%** 的最小权重。
+下界保证 KD 足以产生可观测影响，上界避免其压过检测任务。
+若无候选落入该区间，取最接近 5% 者并在报告中声明。
+
+> 这不是移动判读线——判读线是 mAP 上的（§6），未作任何改动。
+> §4.6 原文即写明「权重是 P1 的固定量」；本节确定的正是这个固定量，
+> 且选取准则在产生任何扫描数字之前写定。
+
+### 5.6 P0 不主张什么
+
+> **P0 不构成任何精度主张。** 本次运行 3 个 epoch、`pretrained=False`、
+> mAP50-95 全程为 0——模型尚未开始收敛。它只证明这条路径接通且可优化，
+> 既不证明泛化，也不证明 mAP 改善。
 > 是否涨点必须由 P1 的同预算多 seed 配对回答。
 
 ## 6. 判读线（提前锁定）
@@ -296,8 +366,7 @@ python experiments/d2/validate_pair.py
 ## 9. 参考
 
 - 机制白话讲解：[`kd_explained.md`](kd_explained.md)
-- P0 路径核对脚本：[`p0_path_check.py`](p0_path_check.py)
+- P0 证据：[`results/p0_train_ok/`](results/p0_train_ok/)（`metrics.csv` + `resolved_args.yaml`）
 - 无混杂变量校验：[`validate_pair.py`](validate_pair.py)
 - 实验表：[`experiment_matrix.csv`](experiment_matrix.csv)
 - 已知局限与降级：[`limitations.md`](limitations.md)
-- 组件级验证（辅助，非 P0 关键路径）：[`p0_smoke.py`](p0_smoke.py)
