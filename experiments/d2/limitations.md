@@ -61,6 +61,61 @@ DINOv3 权重在 Hugging Face 上为 gated，须本人登录并接受 DINOv3 Lic
 
 教师权重仅在训练期使用，不进入部署产物，也不提交 Git——仓库中只记录 model id、revision、许可来源与生成命令。
 
+### 2.3 教师 revision 无法通过配置锁定（将来的改进建议）
+
+`foundation_*` 配置键中**没有 `revision`**
+（`grep -rn revision ultralytics/nn/foundation/ ultralytics/cfg/default.yaml` 零命中），
+`teachers/dinov3.py:144` 的 `from_pretrained(source, **kwargs)` 只传 `local_files_only`
+与可选 `torch_dtype`。因此 model id 相同的两次运行，可能加载到不同的教师内容，
+而配置文件毫无变化。
+
+**本课题的处置：记录，不强制。** 本次使用的 revision（2026-08-26 的 `main`）：
+
+| 教师 | revision |
+|---|---|
+| `facebook/dinov3-vits16-pretrain-lvd1689m` | `114c1379950215c8b35dfcd4e90a5c251dde0d32` |
+| `google/siglip2-base-patch16-512` | `a89f5c5093f902bf39d3cd4d81d2c09867f0724b` |
+
+记录在 `experiment_matrix.csv` 的 `teacher_revision` 列与五份 P1 配置的注释中，复现时人工核对。
+
+**为什么不改代码**：实测这两个仓库极少变动——`google/siglip2-base-patch16-512`
+共 6 次提交且全部集中在 2025-02-17 至 02-21，此后 18 个月未动
+（`facebook/dinov3-vits16-pretrain-lvd1689m` 为 gated，未能查询其历史）。
+在本课题的周期内漂移概率接近零，为此改动上游代码不成比例。
+
+**将来的改进建议**（非本课题交付）：新增 `foundation_revision` 配置键并透传给
+`from_pretrained`，涉及 `cfg/default.yaml`、`cfg/__init__.py` 的 `CFG_STR_KEYS`、
+两个 teacher 后端与 wrapper 的参数下发。两处需要注意：
+
+1. `foundation_weights` 指向本地目录时快照本身已锁定，不应叠加 revision
+2. `foundation_teacher=multi` 有两个教师仓库，单一 revision 字段含义不明——
+   只锁其中一个比不锁更糟，配置会声称一种它并不具备的可复现性
+
+### 2.4 上游 PR：已诊断，未提交
+
+**本分支不含任何 `ultralytics/` 或 `pyproject.toml` 的代码改动。** §2.1 与 §2.3
+是诊断结果与证据，修复留给独立的上游 PR，理由是它们与 D2 的实验结论无关，
+混进实验分支会让两件事互相牵连、都不好审。
+
+建议的 PR 内容（按优先级）：
+
+1. **transformers pin（缺陷，应修）**——`pyproject.toml:96` 的 `foundation` extra
+   下界 `>=4.56.0` → `>=5`，并同步三处错误提示字符串
+   （`dinov3.py:136`、`siglip2.py:137`、`:168`）。
+   依据：代码导入的 `DINOv3ViTBackbone` 在该 pin 允许的整个 4.x 区间内都不存在，
+   按文档安装必然 ImportError（§2.1 双版本实测）。
+2. **导入契约测试（缺陷的防复发）**——当前无任何测试执行真实的
+   `from transformers import ...`（§2.1.1），因此套件会在后端根本用不了的版本上全绿。
+   建议加一个 `importorskip` 守卫的符号存在性断言。
+3. **`foundation_revision` 能力（增强，可选）**——见 §2.3。非缺陷，
+   本课题也未遇到它所防范的问题，优先级最低。
+
+**提交前仍需确认**：`transformers` 5.x 中最早导出 `DINOv3ViTBackbone` 的版本。
+已验证 4.57.0 无、5.15.1 有，中间版本未逐一核实，因此 `>=5` 是保守下界而非精确下界。
+
+**当前环境的绕过方式**：直接 `pip install "transformers>=5"`，
+不依赖 `pip install -e ".[foundation]"` 声明的范围。README 的安装段已按此写。
+
 ## 3. 风险触发与降级
 
 | 风险 | 触发条件 | 降级动作 |

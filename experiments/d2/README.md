@@ -100,7 +100,10 @@ foundation_relational_raw × loss_weight × batch_size
 ## 判读线
 
 ```
-|Δ mAP50-95| < 0.3  且  95% 置信区间包含 0   →   no-go
+|Δ mAP50-95| < 0.003  且  95% 置信区间包含 0   →   no-go
 ```
+
+**`0.003` = 0.3 个百分点**，因为 Ultralytics 的 `metrics/mAP50-95(B)` 是 0–1 刻度。
+按字面取 `0.3` 会让判读线宽达 30 个百分点、失去全部判别力。
 
 本判读线在产生任何 mAP 数字之前提交。结果模糊时**只增加 seed，不移动判读线**。详见 [`design.md §6`](design.md#6-判读线提前锁定)。

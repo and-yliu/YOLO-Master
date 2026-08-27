@@ -154,6 +154,30 @@ KD 项量级约 0.05，属于**轻推**而非主导。
 
 `eval()` + `requires_grad=False` + 不入 optimizer。三者独立校验，缺一不可。
 
+### 4.8 教师版本锁定
+
+裸 model id 不构成完整的教师标识——Hugging Face 仓库可以在 id 不变的情况下更新内容，
+届时同一份配置会加载到不同的教师。因此在证据中记录本次使用的 commit：
+
+| 教师 | revision | 访问 |
+|---|---|---|
+| `facebook/dinov3-vits16-pretrain-lvd1689m` | `114c1379950215c8b35dfcd4e90a5c251dde0d32` | gated（manual），需接受许可 |
+| `google/siglip2-base-patch16-512` | `a89f5c5093f902bf39d3cd4d81d2c09867f0724b` | 公开 |
+
+（截至 2026-08-26 的 `main`。）
+
+**本仓库不支持通过配置指定 revision。** `foundation_*` 键中没有 `revision`
+（`grep -rn revision ultralytics/nn/foundation/ ultralytics/cfg/default.yaml` 零命中），
+`dinov3.py:144` 的 `from_pretrained(source, **kwargs)` 只传 `local_files_only` 与可选 `torch_dtype`。
+
+因此 P0/P1 采取**记录而不强制**：revision 写在 `experiment_matrix.csv` 的 `teacher_revision` 列
+与五份配置的注释中，复现时人工核对。理由是这两个仓库实测很少变动
+（`google/siglip2-base-patch16-512` 自 2025-02-21 起 18 个月无提交），
+在本课题周期内漂移的概率接近零，不值得为此改动上游代码。
+
+> 补 `foundation_revision` 配置能力列为**将来的改进建议**，见 `limitations.md §2.3`。
+> 它解决的是可复现性缺口，不是本课题面临的实际风险。
+
 ## 5. P0：跑通现有 foundation distill 路径
 
 ### 5.1 定义
@@ -226,7 +250,7 @@ foundation_relational_raw × foundation_loss_weight × batch_size
 
 **① KD 权重过小。** `foundation_task_ratio ≈ 0.4%`——蒸馏项仅占检测损失的千分之四。
 §4.6 写的是「轻推而非主导」，但 0.4% 恐怕接近于没有推。
-**这直接威胁 P1 的可解释性**：若 P1 得出 `|ΔmAP| < 0.3`，最合理的解释将是「权重太小」
+**这直接威胁 P1 的可解释性**：若 P1 得出 `|ΔmAP| < 0.003`，最合理的解释将是「权重太小」
 而非「基础模型特征无用」，15 次运行的成本会换回一个无法归因的结论。
 处置见 §5.5。
 
@@ -281,8 +305,10 @@ P1 以 `(seed, budget)` 为配对单位，同一配对内**仅** Foundation 开�
 **主指标**：`mAP50-95`
 
 ```
-|Δ mAP50-95| < 0.3  且  95% 置信区间包含 0   →   no-go
+|Δ mAP50-95| < 0.003  且  95% 置信区间包含 0   →   no-go
 ```
+**`0.003` = 0.3 个百分点**，课题原文写的「0.3」指 **0.3 个百分点**。因为 Ultralytics 的 `metrics/mAP50-95(B)` 是 0–1 刻度。
+按字面取 `0.3` 会让判读线宽达 30 个百分点、失去全部判别力。
 
 - 报告成对差值的均值、样本标准差与 t 区间
 - 样本仅 3 个 seed 时，**必须同时声明区间不稳定**，不得以单次最好结果代替均值
