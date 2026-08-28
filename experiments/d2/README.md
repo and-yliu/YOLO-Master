@@ -22,6 +22,19 @@
 | [`limitations.md`](limitations.md) | 已知局限、环境限制、风险触发与降级方案 |
 | [`results/`](results/) | 归档证据。仓库根 `.gitignore` 忽略 `results.csv` / `args.yaml` / `*.log`，故归档时改名为 `metrics.csv` / `resolved_args.yaml` |
 
+## 脚本
+
+| 脚本 | 回答什么问题 | 什么时候跑 |
+|---|---|---|
+| [`record_environment.py`](record_environment.py) | **这次实验是谁跑的**——commit、dirty 状态、依赖版本、教师 revision 与权重 hash、输入文件 hash | 每批实验**开跑前** |
+| [`validate_pair.py`](validate_pair.py) | **配置有没有混杂**——五份配置除对照轴外是否逐字相同 | 改完配置后 |
+| [`collect_runs.py`](collect_runs.py) | **跑出了什么**——归档 + 跨 run 指标对比 + **事后**混杂核查 | 每批实验**跑完后** |
+
+三者的分工是刻意的：`validate_pair.py` 看的是配置文件，`collect_runs.py` 看的是跑完的
+`args.yaml`——后者才记录了 trainer 真正解析出的值（`optimizer: auto` 展开成什么、
+命令行覆盖了什么、没写的字段取了哪个默认值）。**配置一致不等于实际跑的一致**，
+所以两道检查都要过。
+
 ## 环境安装
 
 ```bash
@@ -42,6 +55,34 @@ python -c "from transformers import DINOv3ViTBackbone; print('ok')"
 python -c "from ultralytics.nn.foundation import DINOv3Teacher; print('ok')"
 ```
 
+## 实验流程
+
+任何一批实验都走同样的三步。**跳过第 1 步或第 3 步的结果不作为证据采信**——
+前者让运行无法追溯到代码版本，后者让「无混杂」停留在配置层面而未在实际运行上验证。
+
+```bash
+# 1. 开跑前：记录本次实验的身份
+python experiments/d2/record_environment.py \
+  --out experiments/d2/results/environment_<批次名>.json
+
+# 2. 跑训练（见下方各批次的命令）
+yolo train ... project=d2/<批次> name=<run名>
+
+# 3. 跑完后：归档 + 汇总 + 事后混杂核查
+python experiments/d2/collect_runs.py runs/detect/d2/<批次>/* --label <批次名>
+```
+
+第 3 步会把每个 run 的 `results.csv` / `args.yaml` 归档进 `results/` 并改名为
+`metrics.csv` / `resolved_args.yaml`（仓库根 `.gitignore:205-206` 按文件名忽略了原名），
+同时生成一张跨 run 对比表和一份混杂核查结论。
+
+**混杂核查为什么要做两次**：[`validate_pair.py`](validate_pair.py) 看的是配置文件，
+`collect_runs.py` 看的是跑完的 `args.yaml`——后者才记录 trainer 真正解析出的值
+（`optimizer: auto` 展开成什么、命令行覆盖了什么、未写字段取了哪个默认值）。
+**配置一致不等于实际跑的一致。**
+
+控制台输出不落盘（Ultralytics 不写日志文件），需要逐 step 行为时自行 `2>&1 | tee`。
+
 ## 复现 P0
 
 P0 = **用配置驱动仓库自身的训练路径跑通一次真实训练**，并核对 teacher / tap / projector / loss 与日志。
@@ -59,9 +100,11 @@ yolo train model=ultralytics/cfg/models/26/yolo26-master-n.yaml \
 未显式给出的 foundation 参数取 `default.yaml` 默认值：`relational` 损失、`align_dim 256`、
 `target_levels [p4]`、`constant` 权重调度。
 
-产物 `runs/detect/d2/p0/train_ok/` 下的 `results.csv` 与 `args.yaml` 即为 P0 证据，
-已归档到 [`results/p0_train_ok/`](results/p0_train_ok/)，并改名为 `metrics.csv` 与
-`resolved_args.yaml`——仓库根 `.gitignore:205-206` 按文件名忽略了原名。
+证据已归档到 [`results/p0_train_ok/`](results/p0_train_ok/)。
+
+> 该批次跑在 `collect_runs.py` 之前，因此归档是手工完成的，且**没有 `environment.json`**——
+> torch 版本与 CUDA driver 是从控制台输出人工读取的（见 `design.md §5.3`）。
+> 这正是上述流程要解决的问题；P1 起不再手工归档。
 
 ### 怎么读这份证据
 
