@@ -57,29 +57,41 @@ python -c "from ultralytics.nn.foundation import DINOv3Teacher; print('ok')"
 
 ## 实验流程
 
-任何一批实验都走同样的三步。**跳过第 1 步或第 3 步的结果不作为证据采信**——
-前者让运行无法追溯到代码版本，后者让「无混杂」停留在配置层面而未在实际运行上验证。
+任何一批实验都走同样的四步。**跳过任何一步的结果不作为证据采信**——
+理由见每步下方。
 
 ```bash
-# 1. 开跑前：记录本次实验的身份
+# 1. 跑之前：确认配置层无混杂
+python experiments/d2/validate_pair.py
+
+# 2. 开跑前：记录本次实验的身份
 python experiments/d2/record_environment.py \
   --out experiments/d2/results/environment_<批次名>.json
 
-# 2. 跑训练（见下方各批次的命令）
+# 3. 跑训练（见下方各批次的命令）
 yolo train ... project=d2/<批次> name=<run名>
 
-# 3. 跑完后：归档 + 汇总 + 事后混杂核查
+# 4. 跑完后：归档 + 汇总 + 事后混杂核查
 python experiments/d2/collect_runs.py runs/detect/d2/<批次>/* --label <批次名>
 ```
 
-第 3 步会把每个 run 的 `results.csv` / `args.yaml` 归档进 `results/` 并改名为
-`metrics.csv` / `resolved_args.yaml`（仓库根 `.gitignore:205-206` 按文件名忽略了原名），
-同时生成一张跨 run 对比表和一份混杂核查结论。
+| 步 | 不做会怎样 |
+|---|---|
+| 1 | 某一格的 `epochs`/`batch`/`lr0` 悄悄不同，训练照跑、数字照出，但差异无法归因到蒸馏 |
+| 2 | 运行无法追溯到代码版本、依赖版本与教师权重 |
+| 4 | 「无混杂」只停留在配置层面，未在**实际解析出的参数**上验证 |
 
-**混杂核查为什么要做两次**：[`validate_pair.py`](validate_pair.py) 看的是配置文件，
+**第 1 步只适用于从配置文件跑的批次**（P1 的 15 次）。命令行驱动的探路实验
+（如权重扫描）不读 `configs/`，第 1 步跳过，改由第 4 步的事后核查兜底。
+
+**混杂为什么要查两次**：[`validate_pair.py`](validate_pair.py) 看的是配置文件，
 `collect_runs.py` 看的是跑完的 `args.yaml`——后者才记录 trainer 真正解析出的值
 （`optimizer: auto` 展开成什么、命令行覆盖了什么、未写字段取了哪个默认值）。
 **配置一致不等于实际跑的一致。**
+
+第 4 步会把每个 run 的 `results.csv` / `args.yaml` 归档进 `results/` 并改名为
+`metrics.csv` / `resolved_args.yaml`（仓库根 `.gitignore:205-206` 按文件名忽略了原名），
+同时生成一张跨 run 对比表和一份混杂核查结论。
 
 控制台输出不落盘（Ultralytics 不写日志文件），需要逐 step 行为时自行 `2>&1 | tee`。
 

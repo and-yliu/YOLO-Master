@@ -1,5 +1,5 @@
-# D2 P1 对照基线（KD off）
-# 四格共享同一份 off 基线：每个 seed 只跑一次，四格都与它比较。
+# D2 P1 格 C｜SigLIP2 × P4 单尺度
+# SigLIP2 亦为 patch 16，在 imgsz 256 下同样得到 16x16 网格（siglip2.py:308），P4 仍零插值。与格 A 只差教师。
 # 除 name 与末尾"唯一变量"区块外，本文件应与 configs/ 下其余四份逐字相同。
 # 改动其余任何一行都会使整个 2x2 对照失效。
 model: ultralytics/cfg/models/26/yolo26-master-n.yaml
@@ -28,16 +28,15 @@ val: true
 plots: false
 save: true
 project: d2/p1
-name: off-s17
+name: c-siglip2-p4-s17
 
 # ---- 唯一变量：Foundation 蒸馏配置 ----
-foundation_enabled: false
-foundation_teacher: none
-foundation_model:
-foundation_loss_weight: 0.0
-
-# 以下字段在 off 组中不生效（loss_weight=0 时 wrapper 直接返回原学生，
-# 见 foundation_distill_model.py:1451），但仍显式写出以便逐字段核对。
+foundation_enabled: true
+foundation_teacher: siglip2
+foundation_model: google/siglip2-base-patch16-512
+# 教师 revision（2026-08-26 的 main）: a89f5c5093f902bf39d3cd4d81d2c09867f0724b
+# 记录用；本仓库无 foundation_revision 配置项，见 limitations.md 2.3
+foundation_loss_weight: 0.05
 foundation_backend: transformers
 foundation_target_levels: [p4]
 foundation_multiscale: false
