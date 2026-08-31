@@ -36,7 +36,7 @@ foundation_teacher: siglip2
 foundation_model: google/siglip2-base-patch16-512
 # 教师 revision（2026-08-26 的 main）: a89f5c5093f902bf39d3cd4d81d2c09867f0724b
 # 记录用；本仓库无 foundation_revision 配置项，见 limitations.md 2.3
-foundation_loss_weight: 0.05
+foundation_loss_weight: 4.0
 foundation_backend: transformers
 foundation_target_levels: [p4]
 foundation_multiscale: false
