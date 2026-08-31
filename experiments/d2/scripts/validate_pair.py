@@ -11,8 +11,8 @@ It does not yet check the per-comparison axis (when comparing teachers, multisca
 scales, the teacher must match). That axis-aware check is deferred; see design.md 7.2.
 
 Usage
-    python experiments/d2/validate_pair.py
-    python experiments/d2/validate_pair.py --configs experiments/d2/configs --matrix experiments/d2/experiment_matrix.csv
+    python experiments/d2/scripts/validate_pair.py
+    python experiments/d2/scripts/validate_pair.py --configs experiments/d2/configs --matrix experiments/d2/experiment_matrix.csv
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ import csv
 import sys
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parent
+HERE = Path(__file__).resolve().parent.parent  # experiments/d2, one level up from scripts/
 
 # Config fields a cell is allowed to own. Everything else -- budget, optimizer, data, seed, determinism --
 # must be identical across all five configs or the 2x2 is void.

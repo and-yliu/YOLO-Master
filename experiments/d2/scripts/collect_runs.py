@@ -15,8 +15,8 @@ auto``, CLI overrides and all. A field that differs across runs but is not the v
 as a confound, whatever the configs promised.
 
 Usage
-    python experiments/d2/collect_runs.py runs/detect/d2/p0/wsweep_*
-    python experiments/d2/collect_runs.py runs/detect/d2/p1/* --label p1 --axis foundation_loss_weight
+    python experiments/d2/scripts/collect_runs.py runs/detect/d2/p0/wsweep_*
+    python experiments/d2/scripts/collect_runs.py runs/detect/d2/p1/* --label p1 --axis foundation_loss_weight
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ import shutil
 import sys
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parent
+HERE = Path(__file__).resolve().parent.parent  # experiments/d2, one level up from scripts/
 RESULTS = HERE / "results"
 
 # Fields expected to differ between runs by design; anything else differing is a confound.

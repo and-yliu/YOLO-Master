@@ -219,8 +219,8 @@ yolo train model=ultralytics/cfg/models/26/yolo26-master-n.yaml \
 
 ### 5.3 实测结果（2026-08-25，CUDA）
 
-证据：[`results/p0_train_ok/metrics.csv`](results/p0_train_ok/metrics.csv)、
-[`results/p0_train_ok/resolved_args.yaml`](results/p0_train_ok/resolved_args.yaml)。
+证据：[`results/p0_train_ok/metrics.csv`](../results/p0_train_ok/metrics.csv)、
+[`results/p0_train_ok/resolved_args.yaml`](../results/p0_train_ok/resolved_args.yaml)。
 环境 torch 2.11.0+cu128 / driver CUDA 12.8 / 单卡。
 
 | epoch | box | cls | dfl | mixture_aux | foundation | relational_raw | task_ratio |
@@ -350,6 +350,25 @@ python experiments/d2/collect_runs.py runs/detect/d2/wsweep/* --label wsweep
 > 且本节的准则完全不读取 mAP。§4.6 原文即写明「权重是 P1 的固定量」；
 > 本节确定的正是这个固定量。
 
+#### 5.5.4 扫描结果：本协议未能选出权重
+
+扫描已按 §5.5.3 执行完毕（6 个权重，证据 `results/wsweep_*`，汇总 `results/wsweep_summary.md`）。
+**按 §5.5.2 判读的结果是：没有任何权重劣化检测损失，含最大值 `w=4.0`。**
+
+这命中预注册的边界情况 ①，但预注册的敏感性检查同时表明结论不可用——
+容差在 1%–5% 全区间内变动都选中 `w=4.0`，六个点的散布仅 0.5%（容差的四分之一）
+且非单调，即噪声主导（边界情况 ③）。§5.5.2 要求「容差必须大于同种子运行噪声」，
+而六次运行全部 `seed=17`、无重复，该前提从未被验证。
+
+进一步的诊断表明这不是「扫描范围不够大」，而是**测量通道无效**：
+`foundation_task_ratio` 比较的是损失**数值**占比，而 `relational` 损失对 Gram 矩阵取
+L1 均值，其梯度被 token 对数稀释且只取符号，与损失值解耦。
+即使 `w=4.0`（KD 占数值 37.6%），KD 自己的目标在 10 epoch 内也只降 2.5%，
+与 `w=0.25` 无法区分。
+
+**完整证据、机制与替代标定方案见 [`kd_gradient_analysis.md`](p1/kd_gradient_analysis.md)。**
+在该文 §5.2/§5.3 的两个探针跑完之前，`foundation_loss_weight` 保持未锁定，P1 不开跑。
+
 ### 5.6 P0 不主张什么
 
 > **P0 不构成任何精度主张。** 本次运行 3 个 epoch、`pretrained=False`、
@@ -378,8 +397,11 @@ P1 以 `(seed, budget)` 为配对单位，同一配对内**仅** Foundation 开�
 
 辅助指标：`mAP50`、训练时长、峰值显存、`foundation_relational_raw`、`foundation_task_ratio`。
 
-其中 `foundation_task_ratio`（KD 项占检测 loss 的比例）是诊断优化失衡的首选信号：
-过大说明 KD 抢戏，过小说明形同未开。
+其中 `foundation_task_ratio`（KD 项占检测 loss 的比例）**曾被列为诊断优化失衡的首选信号**
+（「过大说明 KD 抢戏，过小说明形同未开」）。§5.5.4 证伪了这条读法：
+它是数值占比，对 `relational` 损失与实际梯度影响力无稳定关系——
+实测 `task_ratio = 37.6%` 时 KD 依然形同未开。
+**首选信号改为梯度比**（`kd_gradient_analysis.md` §5.2）；`task_ratio` 降级为辅助记录项。
 
 ## 7. P1 对照矩阵：完整 2×2
 
@@ -454,7 +476,7 @@ python experiments/d2/validate_pair.py
 ## 9. 参考
 
 - 机制白话讲解：[`kd_explained.md`](kd_explained.md)
-- P0 证据：[`results/p0_train_ok/`](results/p0_train_ok/)（`metrics.csv` + `resolved_args.yaml`）
-- 无混杂变量校验：[`validate_pair.py`](validate_pair.py)
-- 实验表：[`experiment_matrix.csv`](experiment_matrix.csv)
+- P0 证据：[`results/p0_train_ok/`](../results/p0_train_ok/)（`metrics.csv` + `resolved_args.yaml`）
+- 无混杂变量校验：[`validate_pair.py`](../scripts/validate_pair.py)
+- 实验表：[`experiment_matrix.csv`](../experiment_matrix.csv)
 - 已知局限与降级：[`limitations.md`](limitations.md)

@@ -21,8 +21,8 @@ Two deliberate choices:
 No token, password, or full environment dump is ever written; see ``limitations.md`` 4.
 
 Usage
-    python experiments/d2/record_environment.py
-    python experiments/d2/record_environment.py --out results/environment_p1.json
+    python experiments/d2/scripts/record_environment.py
+    python experiments/d2/scripts/record_environment.py --out results/environment_p1.json
 """
 
 from __future__ import annotations
@@ -36,14 +36,14 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parent
+HERE = Path(__file__).resolve().parent.parent  # experiments/d2, one level up from scripts/
 ROOT = HERE.parents[1]
 
 # Paths whose modification changes what the experiment *is*, as opposed to leaving stray files around.
 EXPERIMENT_INPUT_PATHS = (
     "experiments/d2/configs",
     "experiments/d2/experiment_matrix.csv",
-    "experiments/d2/validate_pair.py",
+    "experiments/d2/scripts/validate_pair.py",
     "ultralytics/nn/foundation",
     "ultralytics/nn/foundation_distill_model.py",
     "ultralytics/cfg/default.yaml",
