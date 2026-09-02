@@ -26,3 +26,10 @@
 | 权重扫描（6 个权重） | [`../../results/`](../../results/) 下 `wsweep_*` |
 | 探针 A（梯度比） | [`../../results/probe_a_gradient_ratio.json`](../../results/probe_a_gradient_ratio.json) |
 | 探针 B（可学性） | [`../../results/probe_b_learnability.json`](../../results/probe_b_learnability.json) |
+
+## 数据集：COCO → VOC
+
+完整 COCO 上跑了 `off-s17` / `a-s17` 两格探路，链路无问题但单价太高
+（补完 15 格约 161 h）。改用 VOC 重跑整个矩阵，预估约 32 h。
+换算依据、与 COCO 试跑的两处差异、以及运行命令见
+[`voc_batch.md`](voc_batch.md)。

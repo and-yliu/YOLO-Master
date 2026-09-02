@@ -149,6 +149,8 @@ def _build_trainer(args: argparse.Namespace):
         "foundation_model": args.teacher_model,
         # Measure the unweighted KD gradient; w is what we are solving for.
         "foundation_loss_weight": 1.0,
+        "foundation_target_levels": args.target_levels,
+        "foundation_multiscale": len(args.target_levels) > 1,
     }
     trainer = DetectionTrainer(overrides=overrides)
     # _setup_train() takes no arguments and builds the dataloader itself via
@@ -246,6 +248,8 @@ def probe_gradient_ratio(args: argparse.Namespace) -> dict:
     cosine_stats = _summarize(cosines)
     return {
         "batches": len(kd_norms),
+        "teacher": args.teacher,
+        "target_levels": args.target_levels,
         "grad_norm_kd_at_w1": mean_kd,
         "grad_norm_task": mean_task,
         "observed_ratio_at_w1": mean_kd / max(mean_task, 1e-12),
@@ -454,7 +458,13 @@ def main() -> None:
     parser.add_argument("--device", default="0")
     parser.add_argument("--teacher", default="dinov3")
     parser.add_argument("--teacher-model", default="facebook/dinov3-vits16-pretrain-lvd1689m")
+    parser.add_argument(
+        "--target-levels",
+        default="p4",
+        help="ratio/learnable mode: comma-separated student levels, e.g. 'p3,p4,p5' for the multiscale cells",
+    )
     args = parser.parse_args()
+    args.target_levels = [level.strip() for level in args.target_levels.split(",") if level.strip()]
 
     runners = {"kd": lambda: probe_kd_side(seed=args.seed), "ratio": lambda: probe_gradient_ratio(args)}
     runners["learnable"] = lambda: probe_learnability(args)
