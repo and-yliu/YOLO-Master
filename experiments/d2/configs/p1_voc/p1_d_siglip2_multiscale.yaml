@@ -27,7 +27,7 @@ deterministic: true
 
 # ---- 评测与产物 ----
 val: true
-plots: false
+plots: true
 save: true
 project: d2/p1voc
 name: d-s17
