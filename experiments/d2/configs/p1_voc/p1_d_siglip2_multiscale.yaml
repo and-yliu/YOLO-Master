@@ -8,9 +8,7 @@ task: detect
 mode: train
 
 # ---- 预算与优化：五份配置必须完全一致 ----
-# 预算沿用 p1coco 试跑（50 epoch / imgsz 256 / batch 64 / SGD），只把数据集换成 VOC，
-# 使 VOC 批次内部自洽，同时与 COCO 试跑的两个 run 保持可对照的训练配方。
-epochs: 50
+epochs: 400
 imgsz: 256
 batch: 64
 workers: 32
@@ -38,7 +36,7 @@ foundation_teacher: siglip2
 foundation_model: google/siglip2-base-patch16-512
 # 教师 revision（2026-08-26 的 main）: a89f5c5093f902bf39d3cd4d81d2c09867f0724b
 # 记录用；本仓库无 foundation_revision 配置项，见 limitations.md 2.3
-foundation_loss_weight: 4.0
+foundation_loss_weight: 1.9455148710689565
 foundation_backend: transformers
 foundation_target_levels: [p3, p4, p5]
 foundation_multiscale: true

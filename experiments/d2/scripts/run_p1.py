@@ -69,10 +69,10 @@ def main() -> None:
         default=None,
         help="run just these run_ids, comma-separated (e.g. off-s17,a-s17) -- for the staged pilot",
     )
-    parser.add_argument("--project", default="d2/p1", help="must match `project` in the configs")
+    parser.add_argument("--project", default="d2/p1_voc", help="must match `project` in the configs")
     parser.add_argument(
         "--matrix",
-        default=str(HERE / "experiment_matrix.csv"),
+        default=str(HERE / "p1_voc_matrix.csv"),
         help="matrix csv to drive; one training run per row",
     )
     parser.add_argument(

@@ -8,9 +8,7 @@ task: detect
 mode: train
 
 # ---- 预算与优化：五份配置必须完全一致 ----
-# 预算沿用 p1coco 试跑（50 epoch / imgsz 256 / batch 64 / SGD），只把数据集换成 VOC，
-# 使 VOC 批次内部自洽，同时与 COCO 试跑的两个 run 保持可对照的训练配方。
-epochs: 50
+epochs: 400
 imgsz: 256
 batch: 64
 workers: 32
