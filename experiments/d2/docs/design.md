@@ -454,9 +454,18 @@ A/B/C/D ×3 seed = 12 次
 若 B/D 表现更差，**分不清是「多尺度本身没用」还是「插值引入的模糊拖累了」**。
 这不是不能做，是必须显式声明。
 
-**教师轴无此问题**：SigLIP2 亦为 patch 16，在 imgsz 256 下同样得到 16×16
-（`teachers/siglip2.py:308` 的 `pixel_values.shape[-2] // self.patch_size`），
-所以 A ↔ C 的 P4 两边都零插值，是四格中最干净的一条对照。
+**教师轴同样零插值，但这依赖于选对教师变体。** SigLIP2 亦为 patch 16，
+`teachers/siglip2.py:308` 按 `pixel_values.shape[-2] // self.patch_size` 计算网格 ——
+注意 `pixel_values` 是 **processor 的输出**，不是原始输入，所以决定网格的是
+processor 的 `size`，而不是 `imgsz`。
+
+| 教师变体 | processor size | 教师网格 | 与 P4 (16×16) |
+|---|---|---|---|
+| `siglip2-base-patch16-512` | 512×512 | 32×32 | **需 2× 下采样** ❌ |
+| `siglip2-base-patch16-256` | 256×256 | 16×16 | 零插值 ✅ |
+
+**P1-VOC 因此用 `siglip2-base-patch16-256` 变体**。
+A ↔ C 的 P4 两边都零插值，是四格中最干净的一条对照。
 
 ### 7.3 无混杂变量的机械校验
 

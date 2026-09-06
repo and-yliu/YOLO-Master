@@ -33,8 +33,9 @@ name: d-s17
 # ---- 唯一变量：Foundation 蒸馏配置 ----
 foundation_enabled: true
 foundation_teacher: siglip2
-foundation_model: google/siglip2-base-patch16-512
-# 教师 revision（2026-08-26 的 main）: a89f5c5093f902bf39d3cd4d81d2c09867f0724b
+foundation_model: google/siglip2-base-patch16-256
+# 教师 revision（2025-02-21，仓库自此未变）: 3f9f96cb90da5dbc758b01813f2f6f1aee24c1ab
+# 与学生 P4 的 16x16 不同格、需要插值，违反 design.md 4.3 的原生同格硬性检查。
 # 记录用；本仓库无 foundation_revision 配置项，见 limitations.md 2.3
 foundation_loss_weight: 1.9455148710689565
 foundation_backend: transformers
