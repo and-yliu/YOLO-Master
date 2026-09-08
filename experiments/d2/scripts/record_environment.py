@@ -52,7 +52,7 @@ EXPERIMENT_INPUT_PATHS = (
 
 TEACHERS = (
     "facebook/dinov3-vits16-pretrain-lvd1689m",
-    "google/siglip2-base-patch16-512",
+    "google/siglip2-base-patch16-256",
 )
 
 # Weight files worth hashing; config/tokenizer files are covered by the snapshot revision itself.
