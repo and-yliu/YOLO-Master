@@ -44,6 +44,9 @@ ALLOWED_MATRIX_KEYS = {
     "loss_weight",
     "native_grid_match",
     "axis_note",
+    # Bookkeeping, not budget: records whether a row has been run, and is expected to diverge as the matrix is
+    # executed or as a cell is dropped. Holding it constant would force every finished matrix to fail.
+    "status",
 }
 
 
