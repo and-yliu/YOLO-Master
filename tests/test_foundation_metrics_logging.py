@@ -22,6 +22,7 @@ def test_wrapper_exposes_scalar_foundation_metrics_and_clears_eval_cache():
         "foundation_relational_loss",
         "foundation_cosine_raw",
         "foundation_relational_raw",
+        "foundation_task_loss",
         "foundation_task_ratio",
         "foundation_loss_weight",
         "foundation_effective_weight",
@@ -71,3 +72,33 @@ def test_base_trainer_collection_is_noop_for_plain_student():
 
     assert trainer.foundation_metric_steps == 0
     assert trainer._mean_foundation_metrics() == {}
+
+
+class MultiComponentStudent(TinyStudent):
+    """TinyStudent whose task loss is a real per-component vector.
+
+    The base double returns a one-element loss, which makes `.mean()` and `.sum()` numerically identical and so
+    cannot detect a reduction mistake in the denominator. Detection losses are three components (box/cls/dfl),
+    and the trainer reduces them with `.sum()`, so the ratio must divide by the sum.
+    """
+
+    def loss(self, batch, preds=None):
+        """Return a three-component task loss connected to the student graph."""
+        base = self.model[0].weight.square().mean()
+        return torch.stack([base, base * 2.0, base * 3.0]), torch.ones(3, device=batch["img"].device)
+
+
+def test_task_ratio_divides_by_the_summed_task_loss_not_its_mean():
+    wrapper = FoundationDistillationModel(MultiComponentStudent(), DummyTeacher(), config())
+    wrapper.train()
+
+    wrapper({"img": torch.rand(2, 3, 64, 64)})
+    metrics = wrapper.foundation_metrics()
+
+    # The denominator is logged, so the ratio must be exactly reconstructible from it.
+    assert metrics["foundation_task_ratio"] == pytest.approx(
+        metrics["foundation_loss"] / metrics["foundation_task_loss"], rel=1e-9
+    )
+    # A mean over three components would inflate the reported share by exactly 3x.
+    mean_denominator = metrics["foundation_task_loss"] / 3.0
+    assert metrics["foundation_task_ratio"] != pytest.approx(metrics["foundation_loss"] / mean_denominator, rel=1e-6)

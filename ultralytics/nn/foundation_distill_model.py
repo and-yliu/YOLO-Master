@@ -401,7 +401,8 @@ class FoundationDistillationModel(nn.Module):
         losses = self._task_loss_snapshot(task_items)
         active_losses = {task: losses.get(task, 0.0) for task in active if task in losses}
         positive = [value for value in active_losses.values() if value > 1e-8]
-        task_total = float(task_loss.detach().float().mean().item())
+        # Sum, not mean: see the note on `task_scalar` -- the trainer reduces this vector with `.sum()`.
+        task_total = float(task_loss.detach().float().sum().item())
         foundation_value = float(foundation_loss.detach().float().item())
         imbalance = (max(positive) / max(min(positive), 1e-8)) if positive else 0.0
         metrics = {
@@ -1014,7 +1015,9 @@ class FoundationDistillationModel(nn.Module):
         )
         foundation_loss = feature_loss + route_loss + semantic_loss
         self.__dict__["_last_foundation_loss"] = foundation_loss.detach()
-        task_scalar = float(task_loss.detach().float().mean().item())
+        # Sum, not mean: `task_loss` is the per-component vector (box/cls/dfl) that the trainer reduces with
+        # `.sum()`, so the mean would divide by the number of components and report a share ~3x too large.
+        task_scalar = float(task_loss.detach().float().sum().item())
         foundation_scalar = float(foundation_loss.detach().float().item())
         batch_size = max(int(batch["img"].shape[0]), 1)
         self.__dict__["_last_foundation_metrics"] = {
@@ -1024,6 +1027,9 @@ class FoundationDistillationModel(nn.Module):
             # Raw (unweighted) KD components: comparable across loss_weight and batch_size settings.
             "foundation_cosine_raw": float(cosine.detach().float().item()),
             "foundation_relational_raw": float(relation.detach().float().item()),
+            # The denominator is logged alongside the ratio so a run's KD share can be recomputed under a
+            # different convention without re-running it.
+            "foundation_task_loss": task_scalar,
             "foundation_task_ratio": foundation_scalar / max(task_scalar, 1e-8),
             "foundation_loss_weight": float(self.loss_weight),
             "foundation_effective_weight": float(effective_weight),
